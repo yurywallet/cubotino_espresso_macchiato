@@ -1,3 +1,11 @@
+# cubotino_espresso_macchiato
+
+This is a personal, independently-maintained customization of **[CUBOTino_base_version](https://github.com/AndreaFavero71/CUBOTino_base_version)** by Andrea Favero — all credit for the original robot design and code goes to him. This repo is not kept in sync with the upstream project; it carries local changes only (servo jog controls for tuning, HiDPI display fixes, and a per-face accept/reject webcam scanning flow).
+
+For the original project, official builds, videos, and full documentation, see: **https://github.com/AndreaFavero71/CUBOTino_base_version**
+
+---
+
 # CUBOTino base version
 
 This repo contains the files to build CUBOTino_base_version: a Small, Simple, 3D Printed, Inexpensive Rubik's Cube Solver Robot.<br /><br />
