@@ -1,6 +1,7 @@
 # cubotino_espresso_macchiato
 
-This is a personal, independently-maintained customization of **[CUBOTino_base_version](https://github.com/AndreaFavero71/CUBOTino_base_version)** by Andrea Favero — all credit for the original robot design and code goes to him. This repo is not kept in sync with the upstream project; it carries local changes only, summarized below.
+This is a personal, independently-maintained customization of **[CUBOTino_base_version](https://github.com/AndreaFavero71/CUBOTino_base_version)** by Andrea Favero — all credit for the original robot design and code goes to him. 
+This repo is not kept in sync with the upstream project; it carries local changes only, summarized below.
 
 For the original project, official builds, videos, and full documentation, see: **https://github.com/AndreaFavero71/CUBOTino_base_version**
 
@@ -71,17 +72,4 @@ Video tutorial explaining how to present the cube to the webcam: https://youtu.b
 ![title image](/images/title2_pic.png)
 
 
-The movie is also available at /movies folder of this repo, and can be downloaded.<br /><br />
 
-
-# Searching for something more?
-In case you find this robot too simple, or you're interested to a self-enclosed version, then you can consider the CUBOTino Autonomous version:<br />
-- It reuses most of the parts from this Base version !!!<br />
-- Thanks to a camera and a SBC (Raspberry Pi) the robot if fully autonomous.<br />
-- You can see it at: [https://youtu.be/udr6tryxA_Y](https://youtu.be/dEOLhvVMcUg).<br /><br />
-
-
-# Please leave a feedback if you build it
-I hope many of you will decide to build your own CUBOTino, and that you'll enjoy it as much much as I did. <br />
-I hope you will also post an "I Made it", on the Instructables site of this project (link above); <br />
-I can ensure you, seeing a new born CUBOTino makes me feel very well 🙂
