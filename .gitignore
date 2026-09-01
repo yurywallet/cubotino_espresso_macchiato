@@ -3,3 +3,5 @@ CubesDataLog/
 CubesStatusPictures/
 twophase/
 *_backup.txt
+PC_files/cube_color_calibration.json
+PC_files/debug_frame_*.png

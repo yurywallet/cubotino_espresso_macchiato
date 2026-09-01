@@ -294,6 +294,21 @@ def robot_required_moves(solution, solution_Text):
 
 
 
+def invert_solution(solution):
+    """ Inverts a Kociemba-style solving solution (consecutive 2-char blocks FACE+digit, digit 1=CW/2=180/3=CCW)
+    into the scramble that produces the same cube state from solved: moves are reversed in order, and each
+    move's direction is inverted (1<->3, 2 stays 2, since a half turn is its own inverse). This is the standard
+    group-theory identity: if M1,M2,...,Mn solve a cube to solved, then Mn^-1,...,M2^-1,M1^-1 applied to a
+    solved cube reproduce that same starting state. Used to let the robot scramble a solved cube into a
+    randomly generated target, instead of only ever solving toward one."""
+
+    solution = solution.strip().replace(" ", "")
+    inverse_digit = {'1': '3', '2': '2', '3': '1'}
+    blocks = [solution[i:i+2] for i in range(0, len(solution), 2)]
+    inverted_blocks = [face+inverse_digit[digit] for face, digit in reversed(blocks)]
+    return ''.join(inverted_blocks)
+
+
 
 if __name__ == "__main__":
     """ This function convert the cube solution string 'U2 L1 R1 D2 B2 R1 D2 B2 D2 L3 B3 R3 F2 D3 L1 U2 F2 D3 B3 D1' in robot moves

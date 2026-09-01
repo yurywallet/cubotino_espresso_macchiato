@@ -357,6 +357,8 @@ base_cols = ["white", "red", "green", "yellow", "orange", "blue"]   # list with 
 gray_cols = ["gray50", "gray52", "gray54", "gray56", "gray58", "gray60"]  # list with gray nuances for cube scrambling
 # gray_cols = ["white", "red", "green", "purple", "orange", "blue"]
 
+SOLVED_DEFSTR = ''.join(letter*9 for letter in t)   # the 54-char definition string of an already-solved cube
+
 cols = base_cols.copy()        # list with colors initially associated to the cube
 
 curcol = None                  # current color, during colorpick function and sketch color assignment
@@ -375,10 +377,16 @@ cube_solving_string=""         # string variable holding the cube solution manoe
 cube_solving_string_robot=""   # string variable holding the string sent to the robot
 gui_buttons_state="active"     # string variable used to activate/deactivate GUI buttons according to the situations
 robot_working=False            # boolean variable to track the robot working condition, initially False
+just_stopped=False             # True once the robot has been stopped mid-run, until Reset is used; drives the
+                                # big robot button showing "Reset" (instead of the usual disabled/no-data state)
 serialData=False               # boolean variable to track when the serial data can be exchanged, initially False
 robot_moves=""                 # string variable holding all the robot moves (robot manoeuvres)
 cube_status={}                 # dictionary variable holding the cube status, for GUI update to robot permutations
 left_moves={}                  # dictionary holding the remaining robot moves
+resume_target_defstr = SOLVED_DEFSTR   # the definition string the current/last run is ultimately trying to reach
+                                        # (SOLVED_DEFSTR for a normal solve, the random cube for a scramble run) -
+                                        # used by resume_solve() to compute a fresh path from wherever the robot
+                                        # actually stopped back onto the original goal.
 
 timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')      # timestamp used on logged data and other locations
 
@@ -514,7 +522,7 @@ def face_letters(a):
         x = 20 + offset[f][0] * 3 * a + a + offset[f][0]*gap   # x coordinate for text placement
         
         # each of the URFDLB letters are placed on the proper cuvbe face
-        faceletter_id[f]=gui_canvas.create_text(x + width // 2, y + width // 2, font=("", 18), text=t[f], fill="black")
+        faceletter_id[f]=gui_canvas.create_text(x + width // 2, y + width // 2, font=("Segoe UI", 18), text=t[f], fill="black")
 
 
 
@@ -527,10 +535,14 @@ def create_colorpick(a):
     global curcol, cols
     
     cp = tk.Label(gui_canvas, text="color picking")      # gui text label informing the color picking concept
-    cp.config(font=("Arial", 18))                        # gui text font is set
+    cp.config(font=("Segoe UI", 18))                        # gui text font is set
     
-    # gui text label for color picking info is placed on the canvas
-    hp_window = gui_canvas.create_window(2*gap+int(8.25 * width), 2*gap+int(6.45 * width), anchor="nw", window=cp)
+    # gui text label for color picking info is placed on the canvas, just below the F/R/B row's bottom edge
+    # (20 + 6*width + gap, per create_facelet_rects()'s own y formula for that row) and above the color
+    # circles' first row (2*gap + 7*width) - a fixed multiplier here previously drifted into overlapping one
+    # or the other depending on the value chosen, since it wasn't actually tied to either row's real position.
+    label_y = 20 + 6*width + gap + 10
+    hp_window = gui_canvas.create_window(2*gap+int(8.25 * width), label_y, anchor="nw", window=cp)
     
     for i in range(6):                                   # iteration over the six cube faces
         x = 2*gap + int((i % 3) * (a + 15) + 7.65 * a)   # x coordinate for a color palette widget
@@ -664,35 +676,28 @@ def solve():
     """Connect to Kociemba solver to get the solving maneuver."""
     
     global cols, sv, b_read_solve, cube_solving_string, cube_defstr
-    global cube_status, robot_moves, tot_moves, previous_move
-    
+    global cube_status, robot_moves, tot_moves, previous_move, just_stopped, resume_target_defstr
+
+    just_stopped = False                          # a stopped-robot "Reset" state (if any) is now handled
+
     b_robot["state"] = "disable"                 # GUI robot button is disabled at solve() function start
     b_robot["relief"] = "sunken"                 # GUI robot button is sunk at solve() function start
     
-    if gui_scramble_var.get():                   # case the scramble check box is checked
-        if cols != gray_cols.copy():             # case the cube sketch is not made with gray colored facelets
-            cols = gray_cols.copy()              # list with gray nuances is used instead of the cube colors
-            try:
-                for f in range(6):               # iteration over the six cube faces
-                    for row in range(3):         # iteration over the three rows of facelets 
-                        for col in range(3):     # iteration over the three columns of facelets
-                            color=gray_cols[base_cols.index(gui_canvas.itemcget(facelet_id[f][row][col], "fill"))]
-                            gui_canvas.itemconfig(facelet_id[f][row][col], fill=color)
-            except:
-                print("exception 1 at Cubotino_GUI.solve()")
+    # NOTE: scramble mode used to swap the sketch to gray_cols here, obscuring the random target's real colors -
+    # that was confusing rather than useful, so the sketch now always shows real colors regardless of scramble
+    # mode. get_definition_string() maps facelets back to letters via each face's own current center color, so
+    # this is purely cosmetic and doesn't affect solving correctness.
+    if cols == gray_cols.copy():                 # case the cube sketch is still made with gray colored facelets
+        cols = base_cols.copy()                  # (leftover from before this behavior was removed) - restore them
+        try:
+            for f in range(6):                   # iteration over the six cube faces
+                for row in range(3):             # iteration over the three rows of facelets
+                    for col in range(3):         # iteration over the three columns of facelets
+                        color=base_cols[gray_cols.index(gui_canvas.itemcget(facelet_id[f][row][col], "fill"))]
+                        gui_canvas.itemconfig(facelet_id[f][row][col], fill=color)
+        except:
+            print("exception 2 at Cubotino_GUI.solve()")
 
-    elif not gui_scramble_var.get():             # case the scramble check box is not checked
-        if cols == gray_cols.copy():             # case the cube sketch is made with gray colored facelets
-            cols = base_cols.copy()              # list with colors initially associated to the cube
-            try:
-                for f in range(6):               # iteration over the six cube faces
-                    for row in range(3):         # iteration over the three rows of facelets 
-                        for col in range(3):     # iteration over the three columns of facelets
-                            color=base_cols[gray_cols.index(gui_canvas.itemcget(facelet_id[f][row][col], "fill"))]
-                            gui_canvas.itemconfig(facelet_id[f][row][col], fill=color)
-            except:
-                print("exception 2 at Cubotino_GUI.solve()")
-                
     for i in range(6):                   # iteration on six center facelets
         cols[i]= gui_canvas.itemcget(facelet_id[i][1][1], "fill")  # colors list updated as per center facelets on schreen
     draw_cubotino()                     # updates Cubotino cube sketch, with URF centers facelets colors
@@ -715,9 +720,14 @@ def solve():
 
 
                 
-    except:                                              # case the cube definition string is not returned 
+    except:                                              # case the cube definition string is not returned
         show_text("Invalid facelet configuration.\nWrong or missing colors.")  # feedback to user
         return  # function is terminated
+
+    # what this run is ultimately trying to reach: the sketch's own (random) state for a scramble run - the
+    # robot's real starting point is a solved cube, turned into this - or plain SOLVED_DEFSTR otherwise. Kept
+    # around so resume_solve() can compute a fresh path back onto this same goal after a Stop.
+    resume_target_defstr = cube_defstr.strip() if gui_scramble_var.get() else SOLVED_DEFSTR
 
     show_color_counts(cube_defstr)
     
@@ -744,19 +754,37 @@ def solve():
         pos=cube_solving_string.find('(')      # position of the "(" character in the string
         solution=cube_solving_string[:pos]     # string is sliced, by removing the additional info from Kociemba solver
         solution=solution.replace(" ","")      # empty spaces are removed
-        
+
+        if gui_scramble_var.get():             # case the scramble check box is checked: the robot should start from
+            # a SOLVED physical cube and turn it INTO the random target, not solve a cube already in that state -
+            # so the moves it's given are the solve solution reversed and each turn inverted (a scramble is just
+            # the solve sequence run backwards), verified to reproduce the exact random cube from solved.
+            solution = cm.invert_solution(solution)
+            # robot_solver() sends cube_solving_string (not `solution`/robot_moves) over serial to the robot,
+            # so it must be rebuilt with the inverted sequence too - otherwise the robot receives the original
+            # (un-inverted) solve string while only the on-screen preview reflects the scramble, and the
+            # physical cube never gets scrambled as shown. The "(Nf)" suffix (move count) is unchanged by
+            # inversion (same number of blocks, just reordered/remapped), so it's kept as-is.
+            cube_solving_string = solution + " " + cube_solving_string[pos:]
+
         # robot moves dictionary, and total robot moves, are retrieved from the imported Cubotino_moves script
         robot_moves_dict, robot_moves, tot_moves = cm.robot_required_moves(solution, "")
         if not gui_scramble_var.get():                       # case the scramble check box is not checked
             show_text(f'Robot moves: {robot_moves}\n')       # robot moves string is printed on the text window
             if debug:                                        # case the debug checkcutton is selected
                 print(f'Robot moves: {robot_moves}\n')       # feedback is printed to the terminal
-                
-        else:                                                # case the scramble check box is checked
-            show_text(f'Robot moves: As per random cube\n')  # robot moves string is printed on the text window
 
-        for key in range(len(cube_defstr.strip())):          # iteration over the cube status string
-            cube_status[key]=cube_defstr[key]                # dict generation
+        else:                                                # case the scramble check box is checked
+            show_text(f'Robot moves: {robot_moves} (scrambles a solved cube into this random one)\n')
+
+        # cube_status tracks the robot's actual physical cube as moves execute (animate_cube_sketch() permutes
+        # it move by move) - it must start at the robot's REAL starting point. For a normal solve that's the
+        # mixed cube just read (cube_defstr); for a scramble run the physical cube starts SOLVED (cube_defstr
+        # here is the random *target*, not the start) - seeding this wrong wouldn't just mis-animate the
+        # sketch, it would also make resume_solve() compute a path from the wrong state.
+        starting_defstr = SOLVED_DEFSTR if gui_scramble_var.get() else cube_defstr.strip()
+        for key in range(54):                                # iteration over the cube status string
+            cube_status[key]=starting_defstr[key]            # dict generation
         previous_move=0                                      # previous move set to zero
 
     gui_f2.update()                     # GUI f2 part is updated, to release eventual clicks on robot button
@@ -767,16 +795,81 @@ def solve():
 
 
 
+def resume_solve():
+    """NOT CURRENTLY WIRED TO THE UI - see the note in gui_robot_btn_update()'s just_stopped branch. Simulating
+    this function's approach end-to-end (test_resume.py) showed cube_status - kept live by
+    animate_cube_sketch()'s cube_facelets_permutation() calls - does not reliably track the robot's true
+    physical state, even across a complete uninterrupted run, so moves computed from it aren't safe to send to
+    real hardware yet. Left in place (correct in its own logic) for whoever roots-cause that tracking bug, or
+    swaps in a trustworthy source of current-state truth (e.g. a fresh webcam rescan) instead of cube_status.
+
+    Continues a run that was interrupted mid-way by Stop, by computing a brand-new solving sequence from
+    the cube's current (live-tracked) state back onto the original goal, and sending that to the robot.
+
+    The ESP32 firmware has no protocol to "continue this same run from where you stopped" - [start] always
+    executes servo_solve_cube() from move 0 of whatever Kociemba string it's given, and a naive resend of just
+    the remaining moves would risk assuming a physical orientation the robot isn't actually in. Instead this
+    asks the solver for a fresh path: current state -> solved (sv.solve on cube_status, exactly like a normal
+    solve), then - only relevant for a scramble run - solved -> original target (inverting sv.solve on
+    resume_target_defstr, exactly the same trick already used to build the original scramble command). For a
+    normal solve resume_target_defstr is SOLVED_DEFSTR, whose solve is a no-op, so the second leg silently
+    contributes nothing and this same code path is correct for both cases.
+    cube_status must already reflect the robot's true current state for this to be physically correct - see
+    the seeding fix in solve()."""
+
+    global cube_solving_string, cube_status, robot_moves, tot_moves, previous_move, just_stopped
+
+    just_stopped = False
+    current_defstr = ''.join(cube_status[i] for i in range(54))
+
+    try:
+        to_solved = sv.solve(current_defstr, 18, 2)
+        if 'Error' in to_solved:
+            raise ValueError(to_solved)
+        moves1 = to_solved[:to_solved.find('(')].replace(" ", "")
+
+        to_target = sv.solve(resume_target_defstr, 18, 2)
+        if 'Error' in to_target:
+            raise ValueError(to_target)
+        moves2 = cm.invert_solution(to_target[:to_target.find('(')].replace(" ", ""))
+    except Exception as ex:
+        show_text(f"\nCan't resume: {ex}\n")
+        gui_robot_btn_update()
+        return
+
+    solution = moves1 + moves2
+    if len(solution) < 2:                    # case the cube is already at its goal - nothing left to send
+        show_text("\nNothing to resume: the cube is already at its target state.\n")
+        gui_robot_btn_update()
+        return
+
+    cube_solving_string = solution + f" ({len(solution)//2}f)"   # same "(Nf)" suffix format robot_solver() expects
+
+    robot_moves_dict, robot_moves, tot_moves = cm.robot_required_moves(solution, "")
+    show_text(f"Resuming: {robot_moves}\n")
+
+    for key in range(54):                    # cube_status is unchanged (already the resume starting point),
+        cube_status[key] = current_defstr[key]   # just rewritten so it's the exact same dict for the new run
+    previous_move = 0
+
+    send_cube_solving_string_to_robot()   # sends this fresh sequence and starts the robot
+    gui_robot_btn_update()
+
+
+
+
 
 
 def clean():
     """Restore the cube to a clean cube."""
-    
-    global cols, cube_solving_string
-    
+
+    global cols, cube_solving_string, just_stopped
+
+    just_stopped = False                 # a stopped-robot "Reset" state (if any) is now handled
     cube_solving_string=""               # empty string variable to later hold the cube solution
     gui_text_window.delete(1.0, tk.END)  # clears the text window
     gui_scramble_var.set(0)
+    update_read_solve_label()            # .set() doesn't fire the checkbutton's own command callback
     
     cols = base_cols.copy()              # list with colors initially associated to the cube
     create_facelet_rects(width)          # cube sketch is refreshed
@@ -797,13 +890,15 @@ def clean():
 
 def empty():
     """Remove the facelet colors except the center facelets colors."""
-    
-    global cols, cube_solving_string
-    
+
+    global cols, cube_solving_string, just_stopped
+
+    just_stopped = False                  # a stopped-robot "Reset" state (if any) is now handled
     cube_solving_string=""                # empty string variable to later hold the cube solution
     gui_text_window.delete(1.0, tk.END)   # clears the text window
     
     gui_scramble_var.set(0)
+    update_read_solve_label()            # .set() doesn't fire the checkbutton's own command callback
     cols = base_cols.copy()               # list with colors initially associated to the cube
     create_facelet_rects(width)           # cube sketch is refreshed
     
@@ -824,8 +919,9 @@ def empty():
 def random():
     """Generate a random cube and sets the corresponding facelet colors."""
     
-    global gui_read_var, cube_solving_string, cols, gui_buttons_state
-    
+    global gui_read_var, cube_solving_string, cols, gui_buttons_state, just_stopped
+
+    just_stopped = False                     # a stopped-robot "Reset" state (if any) is now handled
     cube_solving_string=""                   # cube solving string is set empty
     gui_text_window.delete(1.0, tk.END)      # clears the text window
     gui_buttons_state = gui_buttons_for_cube_status("disable")   # GUI buttons (cube-status) are disabled
@@ -834,13 +930,11 @@ def random():
     cc.randomize()                           # randomized cube in cubie reppresentation 
     fc = cc.to_facelet_cube()                # randomized cube is facelets reppresentation string
     
-    if gui_scramble_var.get():               # case the scramble check box is checked
-        cols = gray_cols.copy()              # list with gray nuances is used instead of the cube colors
-    
-    elif not gui_scramble_var.get():         # case the scramble check box is not checked
-        cols = base_cols.copy()              # list with colors initially associated to the cube
-    
-    create_facelet_rects(width)              # cube sketch is refreshed to the colors 
+    cols = base_cols.copy()                  # list with colors initially associated to the cube - always used now,
+                                              # even in scramble mode (see the matching comment in solve()): showing
+                                              # the real random-target colors is more useful than hiding them.
+
+    create_facelet_rects(width)              # cube sketch is refreshed to the colors
     
     for i in range(6):                       # iteration on six center facelets
         cols[i]= gui_canvas.itemcget(facelet_id[i][1][1], "fill")  # colors list updated as center facelets on screen
@@ -922,7 +1016,13 @@ def click(event):
             # the selected circle widget gets thinner borger, colored with a visible gray color
             gui_canvas.itemconfig("current", width=5, fill=curcol, outline="Grey55")
         
-        elif idlist[0] not in faceletter_id:                 # case the widget is not one of the six color picking palette
+        elif idlist[0] in faceletter_id:                     # clicked directly on a face's U/R/F/D/L/B letter label:
+            # the label is drawn on top of that center facelet, so a click landing on the letter glyph itself
+            # (its most natural, visible target) would otherwise silently do nothing - recolor the center
+            # facelet underneath it instead, same as clicking anywhere else on that square would.
+            f = faceletter_id.index(idlist[0])
+            gui_canvas.itemconfig(facelet_id[f][1][1], fill=curcol)
+        else:                                                 # case the widget is not one of the six color picking palette
             gui_canvas.itemconfig("current", fill=curcol)    # that widget is filled with the "current color"
     
     draw_cubotino_center_colors()         # draw the cube center facelets with related colors, at Cubotino sketch
@@ -945,17 +1045,22 @@ def scroll(event):
     
         if len(gui_canvas.find_withtag("current"))>0:       # case scrolling over a widget
             facelet=gui_canvas.find_withtag("current")[0]   # widget id is assigned to facelet variable
-            
-            # case the facelet (widget id) is not a color picking and not a cube face letter
-            if facelet not in colorpick_id and facelet not in faceletter_id : 
+
+            if facelet in faceletter_id:                    # scrolling directly over a face's U/R/F/D/L/B letter
+                # label - same fix as click(): recolor the center facelet underneath the label, rather than
+                # silently ignoring scroll input landing on the label's own glyph.
+                facelet = facelet_id[faceletter_id.index(facelet)][1][1]
+
+            # case the facelet (widget id) is not a color picking (a cube face letter was already remapped above)
+            if facelet not in colorpick_id:
                 delta = -1 if event.delta > 0 else 1        # scroll direction
                 if facelet != last_facelet_id:              # case the facelet is different from the lastest one changed
                     last_col=5 if delta>0 else 0            # way to get the first color in cols list at scroll start
                     last_facelet_id=facelet                 # current facelet is asigned to the latest one changed
-                
+
                 last_col=last_col+delta                     # color number is incremented/decrement by the scroll
                 last_col=last_col%6                         # scroll limited within the range of six
-                gui_canvas.itemconfig("current", fill=cols[last_col]) # current facelet is filled with scrolled color
+                gui_canvas.itemconfig(facelet, fill=cols[last_col]) # current facelet is filled with scrolled color
 
             if facelet in (5,14,23):            # case the facelet is a URF face center
                 draw_cubotino_center_colors()   # draw the cube center facelets with related colors, at Cubotino sketch
@@ -993,39 +1098,69 @@ def gui_buttons_for_cube_status(status):
 
 
 
+def send_cube_solving_string_to_robot():
+    """Sends the current cube_solving_string to the robot over serial and starts it. Factored out of
+    robot_solver() so resume_solve() can reuse the exact same send path without recursing back through
+    robot_solver() (which dispatches on the button's current text - resume_solve() runs while it still reads
+    "Resume", not "Send\\ndata\\nto\\nrobot")."""
+
+    global cube_solving_string, cube_solving_string_robot, ser
+
+    s = cube_solving_string                               # shorter local variable name
+    sr = cube_solving_string_robot                        # shorter local variable name
+
+    if s != None and len(s)>1 and "f)" in s:          # case there is useful data to send to the robot
+
+        sr = s.strip().strip("\r\n").replace(" ","")  # empty, CR, LF, cgaracters are removed
+        if sr[0]!="<" or sr[-1:]!=">":                # case the string isn't contained by '<' and '>' characters
+            sr = "<" + sr +">"                        # starting '<' and ending '>' chars are added
+        cube_solving_string_robot = sr                # global variable is updated
+
+        try:
+            ser.write((sr+"\n").encode())             # attempt to send the solving string to the robot
+            print(f"solution sent to ESP32: {sr}")
+            ser.flush()                                 # ensure all solution bytes leave the PC first
+            time.sleep(1.0)                            # allow the ESP32 to finish parsing the solution
+            start_robot()                               # start immediately; the echo is only diagnostic
+        except Exception as ex:
+            print("ERROR: could not send the solution to the ESP32: {}".format(ex))
+
+    else:                                             # case the cube_solving_string doesn't fit pre-conditions
+        print("not a proper string...")               # feedback is printed to the terminal
+
+
+
+
+def reset_robot_and_gui():
+    """The small Reset button's action, shown alongside Resume after a Stop: re-homes the physical robot and
+    brings the GUI cube sketch back to a clean/solved state, for starting over instead of continuing the
+    interrupted job (see resume_solve() for that alternative)."""
+
+    global just_stopped
+
+    just_stopped = False
+    home()                                # send the robot back to its home/safe position
+    clean()                               # clear the on-screen cube sketch/state (also clears scramble mode)
+    gui_robot_btn_update()
+
+
+
+
 def robot_solver():
     """Sends the cube manouvres to the robot
        The solving string for the robot is without space characters, and contained within <> characters
        When the robot is working, the same button is used to stop the robot."""
-    
-    global cube_solving_string, cube_solving_string_robot, ser
-    
-    s = cube_solving_string                               # shorter local variable name
-    sr = cube_solving_string_robot                        # shorter local variable name
-    
-    if b_robot["text"] == "Send\ndata\nto\nrobot":        # case the button is ready to send solving string to the robot
-        if s != None and len(s)>1 and "f)" in s:          # case there is useful data to send to the robot
-            
-            sr = s.strip().strip("\r\n").replace(" ","")  # empty, CR, LF, cgaracters are removed
-            if sr[0]!="<" or sr[-1:]!=">":                # case the string isn't contained by '<' and '>' characters
-                sr = "<" + sr +">"                        # starting '<' and ending '>' chars are added
-            cube_solving_string_robot = sr                # global variable is updated
-            
-            try:
-                ser.write((sr+"\n").encode())             # attempt to send the solving string to the robot
-                print(f"solution sent to ESP32: {sr}")
-                ser.flush()                                 # ensure all solution bytes leave the PC first
-                time.sleep(1.0)                            # allow the ESP32 to finish parsing the solution
-                start_robot()                               # start immediately; the echo is only diagnostic
-            except Exception as ex:
-                print("ERROR: could not send the solution to the ESP32: {}".format(ex))
-        
-        else:                                             # case the cube_solving_string doesn't fit pre-conditions
-            print("not a proper string...")               # feedback is printed to the terminal
-        
+
+    if b_robot["text"] == "Reset":            # case the robot was just stopped mid-run: re-home the physical
+        reset_robot_and_gui()                 # robot and bring the GUI cube sketch back to a clean state
+        # (not "Resume" - see the note in gui_robot_btn_update() on why that's not offered right now)
+
+    elif b_robot["text"] == "Send\ndata\nto\nrobot":        # case the button is ready to send solving string to the robot
+        send_cube_solving_string_to_robot()
+
     elif b_robot["text"] == "STOP\nROBOT":                # case the button is in stop-robot mode
         stop_robot()                                      # calls the stopping robot function
-        
+
     gui_robot_btn_update()                                # updates the cube related buttons status
     draw_cubotino_center_colors()         # draw the cube center facelets with related colors, at Cubotino sketch
 
@@ -1058,8 +1193,9 @@ def left_Cubotino_moves(robot_moves):
 def start_robot():
     """Function that sends the starting command to the robot. Start command is in between square brackets."""
     
-    global robot_working, robot_moves
-    
+    global robot_working, robot_moves, just_stopped
+
+    just_stopped = False                                # a new run is starting: any pending Reset state is stale
     if gui_scramble_var.get():                          # case the scramble check box is checked
         task = "scrambling"
     else:
@@ -1110,30 +1246,49 @@ def stop_robot():
 def gui_robot_btn_update():
     """Defines the Robot buttons state, for the robot related GUI part, according to some global variables """
                              
-    global serialData, cube_solving_string, robot_working, gui_buttons_state
-        
+    global serialData, cube_solving_string, robot_working, gui_buttons_state, just_stopped
+
+    b_reset.grid_remove()   # currently unused - see the note by "Resume" support below
+
     if not robot_working:                                 # case the robot is not working
         gui_buttons_state = gui_buttons_for_cube_status("active")    # buttons for cube status are set active
-        
-        if not serialData:                                # case there is not serial communication set
+
+        if just_stopped:            # case the robot was just interrupted mid-run: offer a Reset instead of the
+            b_robot["text"] = "Reset"                     # usual disabled "no data" state, so the user has an
+            b_robot["relief"] = "raised"                  # obvious way back to a clean GUI + physical robot state
+            b_robot["state"] = "active"
+            b_robot["bg"] = "DodgerBlue2"                 # large robot button is blue colored, to stand out from
+            b_robot["activebackground"] = "DodgerBlue2"   # both the green "send" and red "stop" states
+            # "Resume" (continue from the exact stop point instead of starting over) was attempted here and
+            # pulled back out before shipping: resume_solve() depends on cube_status, which is kept live by
+            # animate_cube_sketch()'s cube_facelets_permutation() calls - and simulating that exact mechanism
+            # end-to-end (see test_resume.py) showed it does NOT reliably reconstruct the correct final cube
+            # state even for a complete, uninterrupted run. That's a pre-existing bug in the on-screen
+            # animation model, not something introduced here, but it means cube_status can't be trusted as
+            # "the robot's real current state" - sending robot moves computed from it would be a physical-
+            # correctness risk. Reset (re-home + clear the GUI) stays the only offered action until that
+            # tracking bug is actually root-caused (or a resume is built on a source of truth other than this
+            # animation state, e.g. a fresh webcam rescan).
+
+        elif not serialData:                                # case there is not serial communication set
             b_robot["relief"] = "sunken"                  # large robot button is lowered
             b_robot["state"] = "disable"                  # large robot button is disabled
-            b_robot["bg"] = "gray90"                      # large robot button is gray colored
-            b_robot["activebackground"] = "gray90"        # large robot button is gray colored
+            b_robot["bg"] = UI_BTN_SECONDARY_BG           # large robot button is gray colored
+            b_robot["activebackground"] = UI_BTN_SECONDARY_BG  # large robot button is gray colored
             if not "f)" in cube_solving_string:           # case the cube solution string has not robot moves
                 b_robot["text"] = "Robot:\nNo connection\nNo data" # large robot button text, to feedback the status
-            
+
             elif "f)" in cube_solving_string:             # case the cube solution string has not robot moves
                 b_robot["text"] = "Robot:\nNot\nConnected" # large robot button text, to feedback the status
-        
+
         # case there serial communication is set, and there are no robot moves on cube solving string
-        if serialData and (not "f)" in cube_solving_string or "(0" in cube_solving_string):
+        elif serialData and (not "f)" in cube_solving_string or "(0" in cube_solving_string):
             b_robot["text"] = "Robot:\nConnected\nNo data" # large robot button text, to feedback the status
             b_robot["relief"] = "sunken"                  # large robot button is lowered
             b_robot["state"] = "disable"                  # large robot button is disabled
-            b_robot["bg"] = "gray90"                      # large robot button is gray colored
-            b_robot["activebackground"] = "gray90"        # large robot button is gray colored
-        
+            b_robot["bg"] = UI_BTN_SECONDARY_BG           # large robot button is gray colored
+            b_robot["activebackground"] = UI_BTN_SECONDARY_BG  # large robot button is gray colored
+
         # case there serial communication is set, and there are robot moves on cube solving string
         elif serialData and "f)" in cube_solving_string and not "(0" in cube_solving_string:
             b_robot["text"] = "Send\ndata\nto\nrobot"     # large robot button text, to feedback the status
@@ -1269,7 +1424,8 @@ def cube_read_solve():
                 # cube color sequence and cube status are returned via the webcam application
                 webcam_cols, webcam_cube_status_string = cam.cube_status(cam_num, cam_wdth, cam_hght, cam_crop,\
                                                                          w_fclts,debug, estimate_fclts, delay,\
-                                                                         c_on_face_captured=_on_face_captured)
+                                                                         c_on_face_captured=_on_face_captured,\
+                                                                         c_scan_mode=gui_scan_mode.get())
 
                 if len(webcam_cols)==6 and len(webcam_cube_status_string)>=54:  # case the app return is valid
                     cols = webcam_cols                        # global variable URFDLB colors sequence is updated
@@ -1332,19 +1488,26 @@ def progress_update(received):
     
     global gui_prog_label_text, gui_prog_label
     
-    if not 'end' in received:                             # case the robot is still running                    
+    if not 'end' in received:                             # case the robot is still running
         move_index=int(received[2:])                      # string part with the progress value
-        percent=progress_percent(move_index)              # percentage is calclated
         try:
+            # percent/animate both index into robot_moves/left_moves by move_index; if those were built from a
+            # different move string than what the robot is actually executing (as scramble mode used to do,
+            # before cube_solving_string was fixed to carry the inverted sequence too) move_index can fall
+            # outside them. Left uncaught, that exception used to propagate out of this function - called with
+            # no surrounding try/except from the serial-reading thread's main loop - silently killing that
+            # daemon thread, so the progress bar/label and sketch animation then stopped updating for the rest
+            # of the run (and every run after, since the thread never restarts). Catching it here instead just
+            # skips that one progress update and keeps the thread (and future updates) alive.
+            percent=progress_percent(move_index)          # percentage is calclated
             gui_prog_bar["value"]=percent                 # progress bar is set to the percentage value
-            gui_prog_label_text.set(percent+" %")         # progress label is updated with percentage value and simbol  
+            gui_prog_label_text.set(percent+" %")         # progress label is updated with percentage value and simbol
             if percent=="100":                            # case the solving percentage has reached 100
                 gui_prog_bar["value"]='0'                 # progress bar is set to zero
                 gui_prog_label_text.set("")               # progress label is set empty
-        except:
-            pass
-    
-        animate_cube_sketch(move_index)  # cube facelets sketch updates according to the robot move in execution
+            animate_cube_sketch(move_index)  # cube facelets sketch updates according to the robot move in execution
+        except Exception as ex:
+            print(f"progress/animation update skipped for move_index={move_index}: {ex}")
 
     elif 'end' in received:                               # case the robot has been stopped                  
         gui_prog_bar["value"]='0'                         # progress bar is set to zero
@@ -1572,7 +1735,7 @@ def update_coms():
     clicked_com = tk.StringVar()                    # string variable used by tkinter for the selection
     clicked_com.set(coms[0])                        # activates first drop down menu position (not a serial port)
     b_drop_COM = tk.OptionMenu(gui_robot_label, clicked_com, *coms, command=connect_check) # populated drop down menu
-    b_drop_COM.config(width=7, font=("Arial", "10"))        # drop down menu settings
+    b_drop_COM.config(width=7, font=("Segoe UI", "10"))        # drop down menu settings
     b_drop_COM.grid(column=0, row=8, sticky="e", padx=10)   # drop down menu settings
     connect_check(0)                                        # updates the button Connect status
     gui_robot_btn_update()                                  # updates the cube related buttons status
@@ -1670,7 +1833,7 @@ def readSerial():
     """Functon, called by a daemon thread, that keeps reading the serial port."""
     
     global serialData, robot_working, gui_prog_bar, cube_solving_string, cube_solving_string_robot
-    global end_method, robot_time
+    global end_method, robot_time, just_stopped
     
     while serialData and ser.isOpen():    # script has set the conditions for Serail com and serial port is found open
         try:
@@ -1702,6 +1865,7 @@ def readSerial():
                 print("====================================================================================")
                 robot_working=False                                   # boolean trcking the robot working is set False
                 end_method="stopped"                                  # variable tracking the end method
+                just_stopped=True   # drives gui_robot_btn_update() to offer a Reset button instead of "No data"
                 if '(' in received and ')' in received:               # case the dat contains open and close parenthesis
                     data_start = received.find('(')                   # position of open parenthesys in received
                     data_end = received.find(')')                     # position of close parenthesys in received
@@ -1791,6 +1955,10 @@ def close_window():
         cam.quit_func()                             # close any active webcam window and camera
     except:
         pass
+    try:
+        root.quit()          # stops the Tk mainloop's event processing; without this, a callback still on the
+    except:                  # call stack (e.g. one that reached here) can otherwise leave mainloop() blocked,
+        pass                  # so the process lingers in the background even though the window is gone
     root.destroy()                                 # GUI is closed
 
 
@@ -2195,6 +2363,61 @@ except:
     pass
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Shared UI theme, matching the webcam window's sidebar design (Cubotino_webcam.py's SIDEBAR_BG/TEXT_PRIMARY/
+# ACCENT/etc, same BGR values converted to RGB hex here). This is UI chrome only - button/label/frame colors
+# and fonts - and must never be confused with the cube's own 6 facelet colors (the color-picker circles, the
+# cube sketch's facelet fills, gray_cols/base_cols/cols) which stay exactly as the solver expects them.
+# option_add() sets a default for every widget of that Tk class going forward; a widget's own explicit
+# .config(bg=...)/font=... (there are a few, e.g. state-indicator buttons) still overrides this default, same
+# as CSS specificity - those are updated individually below where their color also carries meaning.
+# ---------------------------------------------------------------------------------------------------------
+UI_BG = '#F5F7F7'
+UI_TEXT_PRIMARY = '#232323'
+UI_TEXT_SECONDARY = '#6E6E6E'
+UI_ACCENT = '#1E78C8'
+UI_ACCENT_ACTIVE = '#175f9f'
+UI_DANGER = '#D23C3C'
+UI_BTN_SECONDARY_BG = '#DEDEDE'
+UI_BTN_SECONDARY_ACTIVE = '#CFCFCF'
+UI_FONT_FAMILY = 'Segoe UI'
+UI_FONT = (UI_FONT_FAMILY, 11)
+UI_FONT_BOLD = (UI_FONT_FAMILY, 12, 'bold')
+
+root.configure(bg=UI_BG)
+for widget_class in ('Frame', 'Label', 'Labelframe', 'Checkbutton', 'Radiobutton', 'Scale', 'Canvas'):
+    root.option_add(f'*{widget_class}.Background', UI_BG)
+root.option_add('*Label.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Labelframe.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Labelframe.Font', UI_FONT_BOLD)
+root.option_add('*Checkbutton.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Checkbutton.SelectColor', UI_BG)
+root.option_add('*Radiobutton.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Radiobutton.SelectColor', UI_BG)
+root.option_add('*Scale.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Scale.troughColor', UI_BTN_SECONDARY_BG)
+root.option_add('*Button.Background', UI_BTN_SECONDARY_BG)
+root.option_add('*Button.Foreground', UI_TEXT_PRIMARY)
+root.option_add('*Button.ActiveBackground', UI_BTN_SECONDARY_ACTIVE)
+root.option_add('*Button.ActiveForeground', UI_TEXT_PRIMARY)
+root.option_add('*Button.DisabledForeground', UI_TEXT_SECONDARY)
+root.option_add('*Button.relief', 'raised')   # a visible bevel reads as clickable; 'flat' looked like a label.
+root.option_add('*Button.borderWidth', 2)     # raised relief also gives Tk's native press animation for free -
+                                               # a button visibly sinks while the mouse is held down on it.
+root.option_add('*Font', UI_FONT)
+
+
+def style_secondary_button(btn):
+    """Explicitly applies the secondary-button theme to a tk.Button. Some buttons only ever got their color
+    from the option database above and, on Windows, would render with a broken near-black background once
+    their state was toggled to 'disable' and back at runtime (buttons that are always left alone, or whose
+    color was set explicitly at creation, weren't affected) - configuring every color directly on the widget
+    itself, the same way the primary Read & solve button already does, sidesteps that unreliable inheritance."""
+
+    btn.configure(bg=UI_BTN_SECONDARY_BG, fg=UI_TEXT_PRIMARY, activebackground=UI_BTN_SECONDARY_ACTIVE,
+                  activeforeground=UI_TEXT_PRIMARY, disabledforeground=UI_TEXT_SECONDARY)
+
+
 # calculate x and y coordinates for the Tk root window starting coordinate
 ws = root.winfo_screenwidth()             # width of the screen
 hs = root.winfo_screenheight()            # height of the screen
@@ -2203,17 +2426,28 @@ hs = root.winfo_screenheight()            # height of the screen
 # scaled display; grow the requested window size to match, so the bottom row of widgets isn't clipped
 dpi_scale = max(root.winfo_fpixels('1i') / 96.0, 1.0)
 
-app_width = int((12*width+3*gap+40+320) * dpi_scale)               # GUI width is defined via the facelet width
-app_height = int(max(9*width+2*gap+40,740) * dpi_scale)            # GUI height is defined via the facelet width, with a minimum size 670 pixels
-root.minsize(int(0.9*app_width), int(0.9*app_height))       # min GUI size, limiting the resizing on screen
-root.maxsize(min(int(1.2*app_width), ws), min(int(1.2*app_height), hs))  # max GUI size, capped to the actual screen size
+app_width = int((12*width+3*gap+40+420) * dpi_scale)               # GUI width is defined via the facelet width
+app_height = int(max(9*width+2*gap+40,840) * dpi_scale)             # GUI height is defined via the facelet width, with a minimum size 840 pixels
 
-x = int((ws/2) - (app_width/2))           # top left x coordinate to center on the screen the GUI at its opening
-y = int((hs/2) - (app_height/2))          # top left y coordinate to center on the screen the GUI at its opening
+# minsize must never exceed the actual screen: the 840px floor above (times dpi_scale) can be taller than a
+# smaller/scaled display, and an unconstrained minsize bigger than the screen makes the window both open
+# oversized AND impossible to shrink back down (minsize forbids it), which is what maxsize alone doesn't fix.
+min_width = min(int(app_width), ws - 20)
+min_height = min(int(app_height), hs - 80)   # extra margin: title bar + taskbar
+root.minsize(min_width, min_height)                                    # min GUI size, limiting the resizing on screen
+root.maxsize(min(int(1.25*app_width), ws), min(int(1.25*app_height), hs))  # max GUI size, capped to the actual screen size
+
+x = int((ws/2) - (min_width/2))           # top left x coordinate to center on the screen the GUI at its opening
+y = int((hs/2) - (min_height/2))          # top left y coordinate to center on the screen the GUI at its opening
 
 
-root.geometry(f'{app_width}x{app_height}+{x}+{y}') # setting the GUI dimension, and its centering to the screen
+root.geometry(f'{min_width}x{min_height}+{x}+{y}') # setting the GUI dimension (screen-capped), and its centering
 root.resizable(True, True)                         # allowing the root windows to be resizeale
+try:
+    root.state('zoomed')                           # start with a larger window on Windows, so the webcam scan area is easier to read
+except:
+    pass
+root.update_idletasks()
 
 root.rowconfigure(0, weight=1)                 # root is set to have 1 row of  weight=1
 root.columnconfigure(0,weight=1)               # root is set to have 1 column of weight=1
@@ -2256,7 +2490,7 @@ gui_text_window.place(x=20+6*width+10+2*gap, y=20, height=3*width-10, width=6*wi
 
 
 # cube status and solve buttons
-cube_status_label = tk.LabelFrame(gui_f2, text="Cube status", labelanchor="nw", font=("Arial", "12"))
+cube_status_label = tk.LabelFrame(gui_f2, text="Cube status", labelanchor="nw", font=("Segoe UI", "12"))
 cube_status_label.grid(column=0, row=0, columnspan=2, sticky="w", padx=10, pady=10)
 
 
@@ -2265,50 +2499,69 @@ read_modes=["webcam","screen sketch"]  #,"robot color sens"]
 gui_read_var = tk.StringVar()
 for i, read_mode in enumerate(read_modes):
     rb=tk.Radiobutton(cube_status_label, text=read_mode, variable=gui_read_var, value=read_mode)
-    rb.configure(font=("Arial", "10"))
+    rb.configure(font=("Segoe UI", "10"))
     rb.grid(column=0, row=i, sticky="w", padx=10, pady=0)
 gui_read_var.set("webcam")
 
 
 # buttons for the cube status part
 b_read_solve = tk.Button(cube_status_label, text="Read &\nsolve", height=3, width=11, command=cube_read_solve)
-b_read_solve.configure(font=("Arial", "12"), bg="gray90", activebackground="gray90")
+b_read_solve.configure(font=UI_FONT_BOLD, bg=UI_ACCENT, fg='white',
+                        activebackground=UI_ACCENT_ACTIVE, activeforeground='white')  # primary action, accent-colored
 b_read_solve.grid(column=1, row=0, sticky="w", rowspan=3, padx=10, pady=5)
 
 b_empty = tk.Button(cube_status_label, text="Empty", height=1, width=12, command=empty)
-b_empty.configure(font=("Arial", "11"))
+b_empty.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_empty)
 b_empty.grid(column=0, row=3, sticky="w", padx=10, pady=5)
 
-b_clean = tk.Button(cube_status_label, text="Clean", height=1, width=11, command=clean)
-b_clean.configure(font=("Arial", "11"))
+b_clean = tk.Button(cube_status_label, text="Solved", height=1, width=11, command=clean)
+b_clean.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_clean)
 b_clean.grid(column=1, row=3, sticky="w",padx=10, pady=5)
 
 b_random = tk.Button(cube_status_label,text="Random", height=1, width=12, command=random)
-b_random.configure(font=("Arial", "11"))
+b_random.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_random)
 b_random.grid(column=0, row=4, padx=10, pady=10, sticky="w")
 
 # checkbuttons for cube scrambling
+def update_read_solve_label():
+    """Relabels the primary action button to make clear it scrambles (rather than solves) while scramble mode is on."""
+    b_read_solve.config(text="Scramble" if gui_scramble_var.get() else "Read &\nsolve")
+
 gui_scramble_var = tk.BooleanVar()
-cb_scramble=tk.Checkbutton(cube_status_label, text="scramble", variable=gui_scramble_var)
-cb_scramble.configure(font=("Arial", "10"))
+cb_scramble=tk.Checkbutton(cube_status_label, text="scramble", variable=gui_scramble_var, command=update_read_solve_label)
+cb_scramble.configure(font=("Segoe UI", "10"))
 cb_scramble.grid(column=1, row=4, sticky="ew", padx=5, pady=5)
 gui_scramble_var.set(0)
 
 
 # robot related buttons
-gui_robot_label = tk.LabelFrame(gui_f2, text="Robot", labelanchor="nw", font=("Arial", "12"))
+gui_robot_label = tk.LabelFrame(gui_f2, text="Robot", labelanchor="nw", font=("Segoe UI", "12"))
 gui_robot_label.grid(column=0, row=6, rowspan=11, columnspan=2, sticky="n", padx=10, pady=10)
 
 b_robot = tk.Button(gui_robot_label, text="Robot", command=robot_solver, height=6, width=11)
-b_robot.configure(font=("Arial", "12"), relief="sunken", state="disable")
+b_robot.configure(font=("Segoe UI", "12"), relief="sunken", state="disable")
 b_robot.grid(column=1, row=7, sticky="w", rowspan=3, padx=10, pady=5)
 
+# kept gridded-but-hidden for now: was going to be the "Resume" flow's companion Reset button, parked along
+# with Resume itself (see the note in gui_robot_btn_update()) - the big b_robot button alone still handles
+# Reset for the shipped (Resume-less) behavior.
+b_reset = tk.Button(gui_robot_label, text="Reset", height=1, width=11, command=reset_robot_and_gui)
+b_reset.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_reset)
+b_reset.grid(column=1, row=10, sticky="w", padx=10, pady=2)
+b_reset.grid_remove()
+
 b_refresh = tk.Button(gui_robot_label, text="Refresh COM", height=1, width=12, command=update_coms)
-b_refresh.configure(font=("Arial", "11"))
-b_refresh.grid(column=0, row=7, sticky="w", padx=10, pady=5) 
+b_refresh.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_refresh)
+b_refresh.grid(column=0, row=7, sticky="w", padx=10, pady=5)
 
 b_connect = tk.Button(gui_robot_label, text="Connect", height=1, width=12, state="disable", command=connection)
-b_connect.configure(font=("Arial", "11"))
+b_connect.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_connect)
 b_connect.grid(column=0, row=9, sticky="w", padx=10, pady=5)
 
 gui_canvas2=tk.Canvas(gui_robot_label,width=200, height=200)  # a second canvas, for the Cubotino sketch
@@ -2318,12 +2571,13 @@ gui_prog_bar = ttk.Progressbar(gui_robot_label, orient="horizontal", length=175,
 gui_prog_bar.grid(column=0, row=12, sticky="w", padx=10, pady=10, columnspan=2)
 
 gui_prog_label_text = tk.StringVar()
-gui_prog_label = tk.Label(gui_robot_label, height=1, width=5, textvariable=gui_prog_label_text, font=("arial", 12), bg="#E6E6E6")
+gui_prog_label = tk.Label(gui_robot_label, height=1, width=5, textvariable=gui_prog_label_text, font=("Segoe UI", 12), bg=UI_BTN_SECONDARY_BG)
 gui_prog_label.grid(column=1, sticky="e", row=12, padx=10, pady=10)
 
 b_settings = tk.Button(gui_robot_label, text="Settings window", height=1, width=26, state="disable",
                        command= lambda: show_window(settingWindow))
-b_settings.configure(font=("Arial", "11"))
+b_settings.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_settings)
 b_settings.grid(column=0, row=13, columnspan=2,  padx=10, pady=5)
 
 
@@ -2336,7 +2590,7 @@ b_settings.grid(column=0, row=13, columnspan=2,  padx=10, pady=5)
 #### general settings related widgets ####   
 b_back = tk.Button(settingWindow, text="Main page", #fg='red', activeforeground= 'red',
                    height=1, width=12, state="active", command= lambda: show_window(mainWindow))
-b_back.configure(font=("Arial", "12"))
+b_back.configure(font=("Segoe UI", "12"))
 b_back.grid(row=0, column=2, sticky="w", padx=20, pady=10)
 
 
@@ -2344,13 +2598,13 @@ b_back.grid(row=0, column=2, sticky="w", padx=20, pady=10)
 #### getting and sending settings from/to the robot ####
 b_get_settings = tk.Button(settingWindow, text="Get current CUBOTino settings", height=1, width=26,
                            state="active", command= get_current_servo_settings)
-b_get_settings.configure(font=("Arial", "11"))
+b_get_settings.configure(font=("Segoe UI", "11"))
 b_get_settings.grid(row=0, column=0, sticky="w", padx=20, pady=10)
 
 
 b_send_settings = tk.Button(settingWindow, text="Send new settings to CUBOTino", height=1, width=26,
                            state="active", command= send_new_servo_settings)
-b_send_settings.configure(font=("Arial", "11"))
+b_send_settings.configure(font=("Segoe UI", "11"))
 b_send_settings.grid(row=0, column=1, sticky="w", padx=20, pady=10)
 
 
@@ -2358,7 +2612,7 @@ b_send_settings.grid(row=0, column=1, sticky="w", padx=20, pady=10)
 checkVar2 = tk.IntVar()
 c_estimate = tk.Checkbutton(settingWindow, text = "estimate facelets \n(beta version)", variable = checkVar2,
                             command=estimate_fclts_check, onvalue = 1, offvalue = 0)
-c_estimate.configure(font=("Arial", "11"))
+c_estimate.configure(font=("Segoe UI", "11"))
 c_estimate.grid(row=0, column=3, sticky="w", padx=20, pady=10)
 
 
@@ -2366,7 +2620,7 @@ c_estimate.grid(row=0, column=3, sticky="w", padx=20, pady=10)
 checkVar1 = tk.IntVar()
 c_debug = tk.Checkbutton(settingWindow, text = "debug print-out\n(webcam)", variable = checkVar1,
                          command=debug_check, onvalue = 1, offvalue = 0)
-c_debug.configure(font=("Arial", "11"))
+c_debug.configure(font=("Segoe UI", "11"))
 c_debug.grid(row=0, column=4, sticky="w", padx=20, pady=10)
 
 
@@ -2374,32 +2628,32 @@ c_debug.grid(row=0, column=4, sticky="w", padx=20, pady=10)
 
 # overall label frame for the servos pulse width section
 srv_pw_label = tk.LabelFrame(settingWindow, text="Servos - pulse width range",
-                             labelanchor="nw", font=("Arial", "12"))
+                             labelanchor="nw", font=("Segoe UI", "12"))
 srv_pw_label.grid(row=1, column=0, rowspan=2, columnspan=5, sticky="w", padx=20, pady=15)
 
 servos_modes=[("1-2 ms","small"),("0.5-2.5ms","large")]
 
 # label frame and radiobutton for the top servo pulse width
-t_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Top servo", labelanchor="nw", font=("Arial", "12"))
+t_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Top servo", labelanchor="nw", font=("Segoe UI", "12"))
 t_srv_pw_label.grid(row=1, column=0, rowspan=2, columnspan=2, sticky="w", padx=20, pady=15)
 gui_var_t_srv_pw = tk.StringVar()
 pos=0
 for servos_mode, servos_pw in servos_modes:
     rb_srv=tk.Radiobutton(t_srv_pw_label, text=servos_mode, variable=gui_var_t_srv_pw, value=servos_pw)
-    rb_srv.configure(font=("Arial", "10"))
+    rb_srv.configure(font=("Segoe UI", "10"))
     rb_srv.grid(row=2, column=pos, sticky="w", padx=12, pady=5)
     pos+=1
 gui_var_t_srv_pw.set(t_srv_pw_range)
 
 # label frame and radiobutton for the bottom servo pulse width
-b_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Bottom servo", labelanchor="nw", font=("Arial", "12"))
+b_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Bottom servo", labelanchor="nw", font=("Segoe UI", "12"))
 b_srv_pw_label.grid(row=1, column=2, rowspan=2, columnspan=2, sticky="w", padx=20, pady=15)
 servos_modes=[("1-2 ms","small"),("0.5-2.5ms","large")]
 gui_var_b_srv_pw = tk.StringVar()
 pos=0
 for servos_mode, servos_pw in servos_modes:
     rb_srv=tk.Radiobutton(b_srv_pw_label, text=servos_mode, variable=gui_var_b_srv_pw, value=servos_pw)
-    rb_srv.configure(font=("Arial", "10"))
+    rb_srv.configure(font=("Segoe UI", "10"))
     rb_srv.grid(row=2, column=pos, sticky="w", padx=12, pady=5)
     pos+=1
 gui_var_b_srv_pw.set(b_srv_pw_range)
@@ -2407,7 +2661,7 @@ gui_var_b_srv_pw.set(b_srv_pw_range)
 
 # button to process the servos pulse width choice
 pw_update_btn = tk.Button(srv_pw_label, text="confirm\nchanges", height=2, width=18, state="active", command= pw_update)
-pw_update_btn.configure(font=("Arial", "12"))
+pw_update_btn.configure(font=("Segoe UI", "12"))
 pw_update_btn.grid(row=2, column=5, sticky="w", padx=15, pady=10)
 
 
@@ -2415,68 +2669,68 @@ pw_update_btn.grid(row=2, column=5, sticky="w", padx=15, pady=10)
 
 #### top servo related widgets ####
 top_srv_label = tk.LabelFrame(settingWindow, text="Top cover - servo settings",
-                                   labelanchor="nw", font=("Arial", "12"))
+                                   labelanchor="nw", font=("Segoe UI", "12"))
 top_srv_label.grid(row=3, column=0, rowspan=3, columnspan=4, sticky="w", padx=20, pady=0)
 
-s_top_srv_flip = tk.Scale(top_srv_label, label="PWM flip", font=('arial','11'), orient='horizontal',
+s_top_srv_flip = tk.Scale(top_srv_label, label="PWM flip", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=s_pwm_flip_min, to_=s_pwm_flip_max, command=servo_flip)
 s_top_srv_flip.grid(row=4, column=0, sticky="w", padx=12, pady=5)
 s_top_srv_flip.set(t_servo_flip)
 
 
-s_top_srv_open = tk.Scale(top_srv_label, label="PWM open", font=('arial','11'), orient='horizontal',
+s_top_srv_open = tk.Scale(top_srv_label, label="PWM open", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=s_pwm_open_min, to_=s_pwm_open_max, command=servo_open)
 s_top_srv_open.grid(row=4, column=1, sticky="w", padx=12, pady=5)
 s_top_srv_open.set(t_servo_open)
 
 
-s_top_srv_close = tk.Scale(top_srv_label, label="PWM close", font=('arial','11'), orient='horizontal',
+s_top_srv_close = tk.Scale(top_srv_label, label="PWM close", font=('Segoe UI','11'), orient='horizontal',
                               length=170, from_=s_pwm_close_min, to_=s_pwm_close_max, command=servo_close)
 s_top_srv_close.grid(row=4, column=2, sticky="w", padx=12, pady=5)
 s_top_srv_close.set(t_servo_close)
 
 
-s_top_srv_release = tk.Scale(top_srv_label, label="PWM release from close", font=('arial','11'), orient='horizontal',
+s_top_srv_release = tk.Scale(top_srv_label, label="PWM release from close", font=('Segoe UI','11'), orient='horizontal',
                               length=170, from_=0, to_=10, command=servo_release)
 s_top_srv_release.grid(row=4, column=3, sticky="w", padx=12, pady=5)
 s_top_srv_release.set(t_servo_close)
 
 
 flip_btn = tk.Button(top_srv_label, text="FLIP  (toggle)", height=1, width=18, state="active", command= flip_cube)
-flip_btn.configure(font=("Arial", "12"))
+flip_btn.configure(font=("Segoe UI", "12"))
 flip_btn.grid(row=5, column=0, sticky="w", padx=15, pady=10)
 
 open_btn = tk.Button(top_srv_label, text="OPEN", height=1, width=18, state="active", command= open_top_cover)
-open_btn.configure(font=("Arial", "12"))
+open_btn.configure(font=("Segoe UI", "12"))
 open_btn.grid(row=5, column=1, sticky="w", padx=15, pady=10)
 
 close_btn = tk.Button(top_srv_label, text="CLOSE", height=1, width=18, state="active", command= close_top_cover)
-close_btn.configure(font=("Arial", "12"))
+close_btn.configure(font=("Segoe UI", "12"))
 close_btn.grid(row=5, column=2, sticky="w", padx=15, pady=10)
 
 
-s_top_srv_flip_to_close_time = tk.Scale(top_srv_label, label="TIME: flip > close (ms)", font=('arial','11'),
+s_top_srv_flip_to_close_time = tk.Scale(top_srv_label, label="TIME: flip > close (ms)", font=('Segoe UI','11'),
                                         orient='horizontal', length=170, from_=200, to_=1000,
                                         resolution=50, command=flip_to_close_time)
 s_top_srv_flip_to_close_time.grid(row=6, column=0, sticky="w", padx=12, pady=5)
 s_top_srv_flip_to_close_time.set(t_flip_to_close_time)
 
 
-s_top_srv_close_to_flip_time = tk.Scale(top_srv_label, label="TIME: close > flip (ms)", font=('arial','11'),
+s_top_srv_close_to_flip_time = tk.Scale(top_srv_label, label="TIME: close > flip (ms)", font=('Segoe UI','11'),
                                         orient='horizontal', length=170, from_=200, to_=1000,
                                         resolution=50, command=close_to_flip_time)
 s_top_srv_close_to_flip_time.grid(row=6, column=1, sticky="w", padx=12, pady=5)
 s_top_srv_close_to_flip_time.set(t_close_to_flip_time)
 
 
-s_top_srv_flip_open_time = tk.Scale(top_srv_label, label="TIME: flip <> open (ms)", font=('arial','11'),
+s_top_srv_flip_open_time = tk.Scale(top_srv_label, label="TIME: flip <> open (ms)", font=('Segoe UI','11'),
                                     orient='horizontal', length=170, from_=200, to_=1000,
                                     resolution=50, command=flip_open_time)
 s_top_srv_flip_open_time.grid(row=6, column=2, sticky="w", padx=10, pady=5)
 s_top_srv_flip_open_time.set(t_flip_open_time)
 
 
-s_top_srv_open_close_time = tk.Scale(top_srv_label, label="TIME: open <> close(ms)", font=('arial','11'),
+s_top_srv_open_close_time = tk.Scale(top_srv_label, label="TIME: open <> close(ms)", font=('Segoe UI','11'),
                                      orient='horizontal', length=170, from_=100, to_=700,
                                      resolution=50, command=open_close_time)
 s_top_srv_open_close_time.grid(row=6, column=3, sticky="w", padx=12, pady=5)
@@ -2488,35 +2742,35 @@ s_top_srv_open_close_time.set(t_open_close_time)
 
 #### bottom servo related widgets ####
 b_srv_label = tk.LabelFrame(settingWindow, text="Cube holder - servo settings",
-                                   labelanchor="nw", font=("Arial", "12"))
+                                   labelanchor="nw", font=("Segoe UI", "12"))
 b_srv_label.grid(row=7, column=0, columnspan=5, sticky="w", padx=20, pady=10)
 
 
-s_btm_srv_CCW = tk.Scale(b_srv_label, label="PWM CCW", font=('arial','11'), orient='horizontal',
+s_btm_srv_CCW = tk.Scale(b_srv_label, label="PWM CCW", font=('Segoe UI','11'), orient='horizontal',
                               length=170, from_=s_pwm_ccw_min, to_=s_pwm_ccw_max, command=servo_CCW)
 s_btm_srv_CCW.grid(row=8, column=0, sticky="w", padx=13, pady=5)
 s_btm_srv_CCW.set(b_servo_CCW)
 
 
-s_btm_srv_home = tk.Scale(b_srv_label, label="PWM home", font=('arial','11'), orient='horizontal',
+s_btm_srv_home = tk.Scale(b_srv_label, label="PWM home", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=s_pwm_home_min, to_=s_pwm_home_max, command=servo_home)
 s_btm_srv_home.grid(row=8, column=1, sticky="w", padx=12, pady=5)
 s_btm_srv_home.set(b_home)
 
 
-s_btm_srv_CW = tk.Scale(b_srv_label, label="PWM CW", font=('arial','11'), orient='horizontal',
+s_btm_srv_CW = tk.Scale(b_srv_label, label="PWM CW", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=s_pwm_cw_min, to_=s_pwm_cw_max, command=servo_CW)
 s_btm_srv_CW.grid(row=8, column=2, sticky="w", padx=12, pady=5)
 s_btm_srv_CW.set(b_servo_CW)
 
 
-s_btm_srv_extra_sides = tk.Scale(b_srv_label, label="PWM release CW/CCW", font=('arial','11'), orient='horizontal',
+s_btm_srv_extra_sides = tk.Scale(b_srv_label, label="PWM release CW/CCW", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=0, to_=11, command=servo_extra_sides)
 s_btm_srv_extra_sides.grid(row=8, column=3, sticky="w", padx=12, pady=5)
 s_btm_srv_extra_sides.set(b_extra_sides)
 
 
-s_btm_srv_extra_home = tk.Scale(b_srv_label, label="PWM release at home", font=('arial','11'), orient='horizontal',
+s_btm_srv_extra_home = tk.Scale(b_srv_label, label="PWM release at home", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=0, to_=11, command=b_extra_home)
 s_btm_srv_extra_home.grid(row=8, column=4, sticky="w", padx=12, pady=5)
 s_btm_srv_extra_home.set(b_extra_home)
@@ -2539,33 +2793,33 @@ tk.Button(s_btm_srv_CW_jog, text="+", width=3, command=lambda: jog_bottom(s_btm_
 
 
 CCW_btn = tk.Button(b_srv_label, text="CCW", height=1, width=18, state="active", command= ccw)
-CCW_btn.configure(font=("Arial", "12"))
+CCW_btn.configure(font=("Segoe UI", "12"))
 CCW_btn.grid(row=10, column=0, sticky="w", padx=15, pady=10)
 
 
 close_btn = tk.Button(b_srv_label, text="HOME", height=1, width=18, state="active", command= home)
-close_btn.configure(font=("Arial", "12"))
+close_btn.configure(font=("Segoe UI", "12"))
 close_btn.grid(row=10, column=1, sticky="w", padx=15, pady=10)
 
 
 CW_btn = tk.Button(b_srv_label, text="CW", height=1, width=18, state="active", command= cw)
-CW_btn.configure(font=("Arial", "12"))
+CW_btn.configure(font=("Segoe UI", "12"))
 CW_btn.grid(row=10, column=2, sticky="w", padx=15, pady=10)
 
 
-s_btm_srv_spin_time = tk.Scale(b_srv_label, label="TIME: spin (ms)", font=('arial','11'), orient='horizontal',
+s_btm_srv_spin_time = tk.Scale(b_srv_label, label="TIME: spin (ms)", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=300, to_=1200,  resolution=50, command=b_spin_time)
 s_btm_srv_spin_time.grid(row=11, column=0, sticky="w", padx=12, pady=5)
 s_btm_srv_spin_time.set(b_spin_time)
 
 
-s_btm_srv_rotate_time = tk.Scale(b_srv_label, label="TIME: rotate (ms)", font=('arial','11'), orient='horizontal',
+s_btm_srv_rotate_time = tk.Scale(b_srv_label, label="TIME: rotate (ms)", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=300, to_=1300,  resolution=50, command=b_rotate_time)
 s_btm_srv_rotate_time.grid(row=11, column=1, sticky="w", padx=12, pady=5)
 s_btm_srv_rotate_time.set(b_rotate_time)
 
 
-s_btm_srv_rel_time = tk.Scale(b_srv_label, label="TIME: release (ms)", font=('arial','11'), orient='horizontal',
+s_btm_srv_rel_time = tk.Scale(b_srv_label, label="TIME: release (ms)", font=('Segoe UI','11'), orient='horizontal',
                                length=170, from_=0, to_=400,  resolution=50, command=b_rel_time)
 s_btm_srv_rel_time.grid(row=11, column=2, sticky="w", padx=12, pady=5)
 s_btm_srv_rel_time.set(b_rel_time)
@@ -2575,7 +2829,7 @@ s_btm_srv_rel_time.set(b_rel_time)
 
 
 #### webcam  ####
-webcam_label = tk.LabelFrame(settingWindow, text="Webcam", labelanchor="nw", font=("Arial", "12"))
+webcam_label = tk.LabelFrame(settingWindow, text="Webcam", labelanchor="nw", font=("Segoe UI", "12"))
 webcam_label.grid(row=9, column=0, columnspan=6, sticky="w", padx=20, pady=10)
 
 # radiobuttons for webcam source
@@ -2583,30 +2837,30 @@ webcam_nums=[0,1] #,2]
 gui_webcam_num = tk.IntVar()
 for i, webcam_num in enumerate(webcam_nums):
     rb=tk.Radiobutton(webcam_label, text=webcam_num, variable=gui_webcam_num, value=webcam_num)
-    rb.configure(font=("Arial", "10"))
+    rb.configure(font=("Segoe UI", "10"))
     rb.grid(row=10, column=0+i, sticky="w", padx=6, pady=0)
 gui_webcam_num.set(cam_number)
 
 
-s_webcam_width = tk.Scale(webcam_label, label="cam width", font=('arial','11'), orient='horizontal',
+s_webcam_width = tk.Scale(webcam_label, label="cam width", font=('Segoe UI','11'), orient='horizontal',
                                length=120, from_=640, to_=1280,  resolution=20, command=webcam_width)
 s_webcam_width.grid(row=10, column=3, sticky="w", padx=15, pady=5)
 s_webcam_width.set(cam_width)
 
 
-s_webcam_height = tk.Scale(webcam_label, label="cam height", font=('arial','11'), orient='horizontal',
+s_webcam_height = tk.Scale(webcam_label, label="cam height", font=('Segoe UI','11'), orient='horizontal',
                                length=120, from_=360, to_=720,  resolution=20, command=webcam_height)
 s_webcam_height.grid(row=10, column=4, sticky="w", padx=8, pady=5)
 s_webcam_height.set(cam_height)
 
 
-s_webcam_crop = tk.Scale(webcam_label, label="right crop", font=('arial','11'), orient='horizontal',
+s_webcam_crop = tk.Scale(webcam_label, label="right crop", font=('Segoe UI','11'), orient='horizontal',
                                length=120, from_=0, to_=300,  resolution=20, command=webcam_crop)
 s_webcam_crop.grid(row=10, column=5, sticky="w", padx=8, pady=5)
 s_webcam_crop.set(cam_crop)
 
 
-s_facelets = tk.Scale(webcam_label, label="distance", font=('arial','11'), orient='horizontal',
+s_facelets = tk.Scale(webcam_label, label="distance", font=('Segoe UI','11'), orient='horizontal',
                                length=120, from_=10, to_=15,  command=facelets_width)
 s_facelets.grid(row=10, column=6, sticky="w", padx=8, pady=5)
 s_facelets.set(facelets_in_width)
@@ -2614,8 +2868,23 @@ s_facelets.set(facelets_in_width)
 
 save_cam_num_btn = tk.Button(webcam_label, text="save cam settings", height=1, width=16, state="active",
                     command= save_webcam)
-save_cam_num_btn.configure(font=("Arial", "12"))
+save_cam_num_btn.configure(font=("Segoe UI", "12"))
 save_cam_num_btn.grid(row=10, column=8, sticky="w", padx=10, pady=10)
+
+
+scan_mode_label = tk.Label(webcam_label, text="scanning method", font=("Segoe UI", "11"))
+scan_mode_label.grid(row=11, column=0, sticky="w", padx=8, pady=5)
+
+gui_scan_mode = tk.StringVar()
+rb_scan_auto = tk.Radiobutton(webcam_label, text="Auto-detect", variable=gui_scan_mode, value="auto")
+rb_scan_auto.configure(font=("Segoe UI", "10"))
+rb_scan_auto.grid(row=11, column=1, sticky="w", padx=6, pady=0)
+
+rb_scan_grid = tk.Radiobutton(webcam_label, text="Fixed grid", variable=gui_scan_mode, value="grid")
+rb_scan_grid.configure(font=("Segoe UI", "10"))
+rb_scan_grid.grid(row=11, column=2, sticky="w", padx=6, pady=0)
+
+gui_scan_mode.set("auto")
 
 ########################################################################################################################
 

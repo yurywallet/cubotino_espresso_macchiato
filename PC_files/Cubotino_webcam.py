@@ -31,6 +31,21 @@ import math
 import statistics
 import time
 import datetime as dt
+import json
+import os
+
+CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cube_color_calibration.json')
+calibrated_colors = {}   # {'white': (B,G,R), ...}, filled by load_color_calibration()/calibrate_cube_colors()
+
+# fallback reference palette (BGR), used for live display classification when no calibration has been done yet
+DEFAULT_REF_COLORS = {'white':(255,255,255), 'red':(0,0,204), 'green':(0,132,0),
+                       'yellow':(0,245,245), 'orange':(0,128,255), 'blue':(204,0,0)}
+
+CYCLE_COLORS = ['white', 'green', 'yellow', 'orange', 'red', 'blue']   # order a preview cell's color cycles through on click
+
+# the standard color scheme, and unfolded-net layout (col,row in a 4x3 grid), for the 6 scan-order face letters
+STD_LETTER_COLOR = {'U':'white', 'R':'red', 'F':'green', 'D':'yellow', 'L':'orange', 'B':'blue'}
+NET_LAYOUT = {'U':(1,0), 'L':(0,1), 'F':(1,1), 'R':(2,1), 'B':(3,1), 'D':(1,2)}
 
 
 try:
@@ -107,8 +122,9 @@ def read_camera():
     if ret==False:
         print('Webcam frame not available: ret variable == False')
     else:
+        frame = cv2.flip(frame, 1)                 # horizontal flip, so the feed behaves like a mirror instead of a security cam
         frame, w, h = frame_cropping(frame, width, height)     # frame is cropped in order to limit the image area to analyze
-        return frame, w, h 
+        return frame, w, h
 
 
 
@@ -501,40 +517,228 @@ def estimate_facelets(facelets, angle):
 
 
 
+def find_cube_facelet_squares(frame, offset, background_h):
+    ''' Finds the 9 facelet squares of a cube face directly (rather than finding one big outer square and
+    subdividing it). Ported from kkoomen/qbr (https://github.com/kkoomen/qbr), a well-tested, widely used
+    webcam Rubik's cube scanner: find every square-ish contour of plausible facelet size, then find the one
+    contour that has exactly 9 "neighbors" (including itself) sitting at the 8 expected grid positions around
+    it - that's necessarily the center facelet, and its 9 neighbors are the 3x3 array. This confirms the real
+    3x3 grid structure directly (instead of inferring a face boundary and guessing where the 9 cells are, or
+    requiring every sticker pair to have a clean edge between them).
+    Returns the 9 (x, y, w, h) facelet rects in reading order (top-left to bottom-right), or [] if not found.'''
+
+    h, w = frame.shape[:2]
+    roi = frame[background_h:h, offset:w]
+    # Canny on plain grayscale misses edges between two colors that differ a lot in hue but happen to have
+    # similar luminance (e.g. a cyan/yellow sticker against a mid-gray background) - run it on each BGR
+    # channel separately and combine, so a color-only difference still produces an edge.
+    canny = np.zeros(roi.shape[:2], dtype=np.uint8)
+    for channel in cv2.split(roi):
+        canny |= cv2.Canny(cv2.blur(channel, (3, 3)), 30, 60, 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    dilated = cv2.dilate(canny, kernel)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE, offset=(offset, background_h))
+
+    expected_w = width/facelets_in_width   # rough facelet size guess, from the 'distance' slider
+    min_w, max_w = expected_w*0.35, expected_w*3.0   # generous: the cube rarely matches this guess exactly
+
+    candidates = []
+    for contour in contours:
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.1*peri, True)
+        if len(approx) != 4:
+            continue
+        area = cv2.contourArea(contour)
+        x, y, cw, ch = cv2.boundingRect(approx)
+        if ch == 0:
+            continue
+        ratio = cw/float(ch)
+        if 0.8 <= ratio <= 1.2 and min_w <= cw <= max_w and area/(cw*ch) > 0.4:
+            candidates.append((x, y, cw, ch))
+
+    if debug:
+        print(f'facelet candidates: {len(candidates)} (need >=8), expected_w={expected_w:.0f} [{min_w:.0f}-{max_w:.0f}]')
+    if len(candidates) < 8:
+        return []
+
+    # Fit a 3x3 grid across all candidates by clustering their centers into 3 column x-positions and 3 row
+    # y-positions - rather than requiring one specific candidate to literally be the center facelet and have
+    # all 8 others sit at its expected neighbor offsets. A real cube's center facelet often carries a small
+    # manufacturer logo, whose extra edges can fragment/erase just that one cell's contour even when the
+    # other 8 are detected cleanly; row/column clustering finds the grid from whichever cells ARE present,
+    # so a single missing slot (most commonly the center) is tolerated and its rect estimated from its row
+    # and column neighbors, instead of requiring the true center to be one of the detected candidates.
+    avg_cw = sum(c[2] for c in candidates)/len(candidates)
+    avg_ch = sum(c[3] for c in candidates)/len(candidates)
+    centers = [(x+cw/2, y+ch/2, cw, ch) for (x, y, cw, ch) in candidates]
+
+    def cluster_1d(values, tol):
+        values = sorted(values)
+        groups = [[values[0]]]
+        for v in values[1:]:
+            if v - groups[-1][-1] <= tol:
+                groups[-1].append(v)
+            else:
+                groups.append([v])
+        return [sum(g)/len(g) for g in groups]
+
+    col_centers = cluster_1d([c[0] for c in centers], avg_cw*0.6)
+    row_centers = cluster_1d([c[1] for c in centers], avg_ch*0.6)
+    if len(col_centers) != 3 or len(row_centers) != 3:
+        return []       # candidates don't resolve into a clean 3x3 layout (wrong count of distinct rows/columns)
+
+    grid = [[None]*3 for _ in range(3)]
+    for (cxc, cyc, cw, ch) in centers:
+        ci = min(range(3), key=lambda i: abs(col_centers[i]-cxc))
+        ri = min(range(3), key=lambda i: abs(row_centers[i]-cyc))
+        if grid[ri][ci] is not None:
+            return []   # two candidates landed in the same grid slot: not a clean, confident 3x3 read this frame
+        grid[ri][ci] = (cxc, cyc, cw, ch)
+
+    missing = [(r, c) for r in range(3) for c in range(3) if grid[r][c] is None]
+    if len(missing) > 1:
+        return []
+    for (r, c) in missing:                      # estimate the one missing cell from its row/column position
+        grid[r][c] = (col_centers[c], row_centers[r], avg_cw, avg_ch)
+
+    rects = []
+    for r in range(3):
+        for c in range(3):
+            cxc, cyc, cw, ch = grid[r][c]
+            rects.append((int(cxc-cw/2), int(cyc-ch/2), int(cw), int(ch)))
+    return rects
+
+
+def synthetic_facelets_from_rects(rects, inset=6):
+    ''' Builds 9 synthetic square contours from the (x, y, w, h) facelet rects found by
+    find_cube_facelet_squares(), each shrunk a few pixels in from its detected edges to stay clear of the
+    gaps between stickers. Returned in the same contours/hierarchy format cv2.findContours produces, so
+    they feed into the existing downstream pipeline (get_approx_contours, get_facelets, order_9points,
+    read_color, ...) unchanged.'''
+
+    contours, hierarchy_rows = [], []
+    for (x, y, w, h) in rects:
+        pts = np.array([[x+inset, y+inset], [x+w-inset, y+inset],
+                         [x+w-inset, y+h-inset], [x+inset, y+h-inset]], dtype=np.int32)
+        contours.append(pts.reshape((-1, 1, 2)))
+        hierarchy_rows.append([-1, -1, -1, -1])   # no child contour, passes the get_facelets() hierarchy check
+
+    hierarchy = np.array([hierarchy_rows])   # shape (1,9,4), matching cv2.findContours' own return shape
+    return contours, hierarchy
+
+
+def detect_in_fixed_zone(frame, w, h):
+    ''' Draws a fixed target zone in the frame for the user to hold a cube face against, and looks for the 9
+    facelet squares (see find_cube_facelet_squares()) ONLY within that zone - restricting both detection and
+    color sampling to a small, known region, rather than hunting the whole frame where background clutter can
+    get mistaken for the cube. The zone's border is white by default and turns GREEN as soon as a full 3x3 grid
+    is confirmed inside it, giving direct visual feedback that the cube is positioned correctly. Used by both
+    the normal scan (read_facelets()) and color calibration (calibrate_cube_colors()).
+    background_h/offset keep the zone off the top/bottom text bands and the legend/sketch area.
+    Returns the 9 (x, y, w, h) facelet rects in full-frame coordinates (or [] if not confirmed).'''
+
+    zone_edge = max(20, int(width/facelets_in_width))
+    zone_w = zone_edge*3
+    zx0 = offset + (w - offset - zone_w)//2
+    zy0 = background_h + (h - background_h - zone_w)//2
+
+    # search a larger area than the drawn guide box (the box is a rough aiming target, not a strict boundary):
+    # the user's cube rarely matches its exact size/position, so search margin*zone_w around it, clipped to frame
+    margin = 1.6
+    search_w = int(zone_w*margin)
+    sx0 = max(offset, zx0-(search_w-zone_w)//2)
+    sy0 = max(background_h, zy0-(search_w-zone_w)//2)
+    sx1 = min(w, sx0+search_w)
+    sy1 = min(h, sy0+search_w)
+
+    zone = frame[sy0:sy1, sx0:sx1]
+    rects = find_cube_facelet_squares(zone, 0, 0)                    # search the (larger) area around the guide box
+    rects = [(x+sx0, y+sy0, rw, rh) for (x, y, rw, rh) in rects]      # back to full-frame coordinates
+
+    zone_color = (0, 255, 0) if rects else (255, 255, 255)   # green once the cube is confirmed inside the zone
+    cv2.rectangle(frame, (zx0, zy0), (zx0+zone_w, zy0+zone_w), zone_color, 3)
+    for (x, y, rw, rh) in rects:
+        cv2.rectangle(frame, (x, y), (x+rw, y+rh), (255, 0, 0), 1)   # each detected facelet, thin blue square
+
+    return rects
+
+
 def read_facelets(det_face_time, delay, proceed):
-    ''' Function that uses cv2 to retrieve contours, from an image (called frame in this case)
-    Contours are searched on the 'eroded edges' frame copy
-    ROI (Region Of Interest) restricts the image to where the cube images really is
+    ''' Shows the fixed target zone (see detect_in_fixed_zone()) and reads the 9 facelets once the cube is
+    confirmed inside it (zone border turns green) and the capture delay/spacebar gate has passed.
+    The camera view itself stays clean (no text drawn on it) - status/instructions live in the sidebar,
+    composed by the caller (cubeAF()) via render_sidebar()/compose_and_show().'''
 
-    Notes on 'cv2 find contours'
-    Contour's tree is used (cv2.RETR_TREE), to identify children contours (contours within other contrours)
-    Approximation (v2.CHAIN_APPROX_SIMPLE) reduces the amount of pixel down to only vertes
-    Offset allows to use same coordinate related to the frame, on left not used to overlay info 
-    background_h prevents searching for contours on the top text bandwidth.'''
-    
     wait_time = int(delay-(time.time() - det_face_time)) + 1
-    
+
+    rects = detect_in_fixed_zone(frame, w, h)
+
+    if rects:
+        # get_facelets() (downstream) only accepts contours within [min_area, max_area]; that range is normally
+        # derived from the 'distance' slider guess of facelet size. Now that the 9 facelets have actually been
+        # found and confirmed as a real 3x3 grid, size the acceptance window from their real, measured area
+        # instead - directly tied to what's in frame rather than a separate manual guess.
+        global min_area, max_area
+        avg_area = sum(rw*rh for (_, _, rw, rh) in rects) / len(rects)
+        min_area = avg_area*0.4
+        max_area = avg_area*2.0
+
+    if (wait_time > 0 and not proceed) or not rects:
+        return [], None       # not yet time to capture, or the cube isn't confirmed in the zone: nothing to hand downstream
+
+    return synthetic_facelets_from_rects(rects)
+
+
+
+
+def read_facelets_fixed_grid(det_face_time, delay, proceed):
+    ''' Alternative to read_facelets(): instead of hunting for square contours via edge detection,
+    draws a fixed 3x3 grid that the user aligns the cube face to, and returns 9 synthetic square
+    contours at the grid's exact position once it's time to capture. This feeds the very same
+    downstream pipeline (get_facelets, order_9points, read_color, the accept/reject gate, etc.)
+    used by read_facelets(), just from a different (non edge-detected) source.'''
+
+    wait_time = int(delay-(time.time() - det_face_time)) + 1
+
     if wait_time > 0 and not proceed:
-        # informative text is added on frame top, as guidance and for decoration purpose
-        cv2.putText(frame, str(f'Prepare side {sides[side]}, reading in {wait_time} s'), (10, 30), font, fontScale*1.2,fontColor,lineType)
-
-        # informative text is added on frame bottom, as guidance
-        cv2.putText(frame, str('ESC to escape, spacebar to proceed'), (10, int(h-12)), font, fontScale*1.2,fontColor,lineType)
+        cv2.putText(frame, str(f'Align side {sides[side]} to the grid, capturing in {wait_time} s'),
+                    (10, 30), font, fontScale*1.2, fontColor, lineType)
+        cv2.putText(frame, str('ESC to escape, spacebar to capture now'), (10, int(h-12)), font, fontScale*1.2, fontColor, lineType)
     else:
-        # informative text is added on frame top, as guidance and for decoration purpose
-        cv2.putText(frame, str(f'Reading side {sides[side]}'), (10, 30), font, fontScale*1.2,fontColor,lineType)
+        cv2.putText(frame, str(f'Capturing side {sides[side]}'), (10, 30), font, fontScale*1.2, fontColor, lineType)
+        cv2.putText(frame, str('ESC to escape'), (10, int(h-12)), font, fontScale*1.2, fontColor, lineType)
 
-        # informative text is added on frame bottom, as guidance
-        cv2.putText(frame, str('ESC to escape'), (10, int(h-12)), font, fontScale*1.2,fontColor,lineType)
+    cube_centers_color_ref(frame)           # same reference legend as the auto-detect mode
+    plot_colors(BGR_mean, deco_edge, frame, font, fontScale, lineType)
 
-    roi = frame.copy()[background_h:h, offset:w]  # roi is made on a slice from the copy of the frame image
-#         roi_height, roi_width, _ = roi.shape    # returns roi's dimensions
-    cube_centers_color_ref(frame)           # returns the colored centers cube (1 facelet) within the cube's frame
-    plot_colors(BGR_mean, edge, frame, font, fontScale, lineType)
-    edges = edge_analysis(roi)              # edges analysis restriceted to RegionOfInterest (roi)      
-    (contours, hierarchy) = cv2.findContours(edges.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE, offset=(offset,background_h))
-    
-    return (contours, hierarchy)
+    grid_edge = max(20, int(width/facelets_in_width))    # per-cell size, from the existing 'distance' slider setting
+    grid_w = grid_edge*3
+    gx0 = offset + (w - offset - grid_w)//2               # horizontally centered in the usable (non-legend) area
+    gy0 = background_h + (h - background_h - grid_w)//2   # vertically centered in the usable (non-banner) area
+
+    for row in range(3):                                  # draws the 9-cell grid outline every frame, as alignment guide
+        for col in range(3):
+            x = gx0 + col*grid_edge
+            y = gy0 + row*grid_edge
+            cv2.rectangle(frame, (x, y), (x+grid_edge, y+grid_edge), (255, 255, 255), 2)
+
+    if wait_time > 0 and not proceed:       # not yet time to capture: grid is drawn, nothing returned yet
+        return [], None
+
+    contours = []                           # 9 synthetic square contours, at the grid's exact pixel position
+    hierarchy_rows = []
+    for row in range(3):
+        for col in range(3):
+            cx = gx0 + col*grid_edge + grid_edge//2
+            cy = gy0 + row*grid_edge + grid_edge//2
+            half = grid_edge//2 - 2         # slightly inset from the drawn outline
+            pts = np.array([[cx-half, cy-half], [cx+half, cy-half], [cx+half, cy+half], [cx-half, cy+half]], dtype=np.int32)
+            contours.append(pts.reshape((-1, 1, 2)))
+            hierarchy_rows.append([-1, -1, -1, -1])   # no child contour, passes the get_facelets() hierarchy check
+
+    hierarchy = np.array([hierarchy_rows])  # shape (1,9,4), matching cv2.findContours' own return shape
+
+    return contours, hierarchy
 
 
 
@@ -877,6 +1081,9 @@ def cube_centers_color_ref(frame):
     ''' It suggests the faces (center) color as guidance on screen, to present the right cube face to the camera.
     This function fills the center facelets with refence color.'''
 
+    global deco_edge
+    edge = deco_edge   # decorative sketches use deco_edge, scaled to fit the actual frame height (see start_up())
+
     x_start=int(edge/3)
     y_start=int(edge*6)
     square_start_pt, square_dict = cube_sketch_coordinates(x_start,y_start, edge)
@@ -930,18 +1137,35 @@ def plot_colors(BGR_mean, edge, frame, font, fontScale, lineType):
         cv2.rectangle(frame, tuple(point), (point[0]+edge, point[1]+edge), (0, 0, 0), 1)
 
     # iteration on the global dict with stored the avg BGR value of each facelet detected so far
-    for i in range(len(BGR_mean)):   
-        B=BGR_mean[i][0]                                    # blue component of the mean BGR, for the 'í' facelet
-        G=BGR_mean[i][1]                                    # green component of the mean BGR, for the 'í' facelet
-        R=BGR_mean[i][2]                                    # red component of the mean BGR, for the 'í' facelet
-#         start_point=square_dict[i]              
+    for i in range(len(BGR_mean)):
+        # the raw captured BGR is classified to the nearest of the 6 known cube colors, and that reference's
+        # own flat color is what gets displayed - never the raw, lighting-tinted color the camera actually saw
+        _, (B, G, R) = classify_bgr_to_6(BGR_mean[i])
         points=inner_square_points(square_dict,i,edge)      # coordinates for 'i' facelet at the sketch
-        cv2.fillPoly(frame, pts = [points], color=(B,G,R))  # 'i' facelet is colored with the detected average BGR color
+        cv2.fillPoly(frame, pts = [points], color=(B,G,R))  # 'i' facelet is colored with its classified color
 
 
 
 
 
+
+
+KOCIEMBA_POSITION = {'U':0, 'R':1, 'F':2, 'D':3, 'L':4, 'B':5}  # each letter's 9-facelet block index in kociemba's fixed U,R,F,D,L,B order
+CENTER_COLOR = {4:'white', 13:'red', 22:'green', 31:'yellow', 40:'orange', 49:'blue'}  # each face's center facelet's color - fixed by definition, never classified
+
+
+def reorder_to_kociemba_position(flat_list, scan_order_letters):
+    ''' The 54-item flat_list (BGR or any per-facelet value) was accumulated in SCAN order - whatever order
+    'sides' presents the 6 faces to the user in - but the color-interpretation functions below assume the
+    fixed kociemba position order U,R,F,D,L,B (they read specific fixed indices directly, e.g. facelet 4 is
+    always assumed to be U's center, 13 is R's center, ...). This reorders the 9-facelet blocks from scan
+    order into that fixed position order, so the scan can present the 6 faces in any order.'''
+
+    reordered = [None]*54
+    for scan_idx, letter in enumerate(scan_order_letters):
+        kpos = KOCIEMBA_POSITION[letter]
+        reordered[kpos*9:(kpos+1)*9] = flat_list[scan_idx*9:(scan_idx+1)*9]
+    return reordered
 
 
 def cube_colors_interpreted(BGR_detected):
@@ -984,10 +1208,15 @@ def cube_colors_interpreted(BGR_detected):
         print(f'\nBGR_detected: {BGR_detected}')   # feedback is printed to the terminal
         print(f'\nHSV: {HSV_detected}')            # feedback is printed to the terminal
 
-    # Step2: center's facelets are used as initial reference
-    cube_ref_colors = {'white':BGR_detected[4], 'red':BGR_detected[13], 'green':BGR_detected[22],
-                       'yellow':BGR_detected[31], 'orange':BGR_detected[40], 'blue':BGR_detected[49]}
-    
+    # Step2: initial reference colors. A saved calibration (see calibrate_cube_colors(), measured directly
+    # off the user's own cube under their own lighting) is preferred when available, since it's far more
+    # reliable than trusting whichever 6 center facelets this particular scan happened to detect.
+    if len(calibrated_colors) == 6:
+        cube_ref_colors = dict(calibrated_colors)
+    else:
+        cube_ref_colors = {'white':BGR_detected[4], 'red':BGR_detected[13], 'green':BGR_detected[22],
+                           'yellow':BGR_detected[31], 'orange':BGR_detected[40], 'blue':BGR_detected[49]}
+
     # Step3: dictionary with the color distances from the (initial) references
     color_distance={}                                             # empty dict to store all the color distances for all the facelets
     cube_ref_colors_lab={}                                        # empty dictionary to store color refences in Lab color space
@@ -1056,8 +1285,15 @@ def cube_colors_interpreted(BGR_detected):
     for i in range(54):
         index = key_ordered_by_color_distance.index(i)
         cube_status[i]=cube_status_by_color_distance[index]
-    
-    
+
+    # A center facelet never moves relative to its own face - on a real cube, U's center IS white, R's IS red,
+    # and so on, always, by definition. This isn't a guess to classify like the other 8 facelets on that face;
+    # it's a structural fact of the puzzle. Force it, so a bad calibration/lighting reading (which can pull a
+    # center's distance-based classification toward the wrong color, e.g. a white center reading as blue) can
+    # never produce a self-contradictory cube status where a face's own center isn't that face's color.
+    for pos, color in CENTER_COLOR.items():
+        cube_status[pos] = color
+
     # Step9: Cube color sequence for a nicer decoration on interpreted colors (using the HSV color space)
     VS_value={}                            # dict to store the V-S (Value-Saturation) value of all facelets
     Hue={}                                 # dict to store the Hue value of all facelets
@@ -1236,13 +1472,33 @@ def cube_colors_interpreted_HSV(BGR_detected, HSV_detected):
             VSdelta[i]=int(V)+int(V)-int(S)-abs(3*(int(H)-int(Hw)))  # V+(V-S)+abs(3*deltaH) value for all the facelets
             i+=1
         
-        # ordering the VSdelta by increasing values (9 highest values are the 9 white facelets)
-        VSdelta_copy=VSdelta.copy()       # a dict copy is made, to drop items while the analysis progresses
-    
-        # a new dict with V-S delta value ordered is generated, in order to have the white facelets close to each other
-        VSdelta_ordered={k: v for k, v in sorted(VSdelta_copy.items(), key=lambda item: item[1])}
-        key_ordered_by_VSdelta = [x for x in VSdelta_ordered.keys()]    # list with the key of the (ordered) dict is generated
-        white_facelets_list=key_ordered_by_VSdelta[-9:]                 # white facelets have the biggest H-S value, therefore are the last 9
+        # white facelets are the brightest, least saturated stickers and can include a logo/print;
+        # a simple top-9 V-S ranking is too strict in that case, so we allow small brightness/saturation tolerance
+        # and fall back to a brightness ranking if the center-based whitelist does not find 9 candidates.
+        white_ref_v = max(100, Vw)
+        white_ref_s = max(20, Sw)
+        white_candidates = []
+        for facelet, (Hf, Sf, Vf) in HSV_detected.items():
+            if facelet in colored_centers or facelet == white_center:
+                continue
+            if Vf >= white_ref_v * 0.72 and Sf <= max(white_ref_s * 2.0, 60):
+                white_candidates.append((facelet, int(Vf) - int(Sf)))
+
+        if len(white_candidates) < 9:
+            for facelet, (Hf, Sf, Vf) in HSV_detected.items():
+                if facelet in colored_centers or facelet == white_center:
+                    continue
+                white_candidates.append((facelet, int(Vf) - int(Sf)))
+
+        if white_candidates:
+            white_candidates = sorted(white_candidates, key=lambda item: item[1], reverse=True)
+            white_facelets_list = [facelet for facelet, _ in white_candidates[:9]]
+        else:
+            # old fallback if no bright white facelets are detected at all
+            VSdelta_copy=VSdelta.copy()
+            VSdelta_ordered={k: v for k, v in sorted(VSdelta_copy.items(), key=lambda item: item[1])}
+            key_ordered_by_VSdelta = [x for x in VSdelta_ordered.keys()]
+            white_facelets_list = key_ordered_by_VSdelta[-9:]
 
         if debug:   # case the variable debug is set True
             print(f'White facelets: {white_facelets_list}')   # feedback is printed to the terminal
@@ -1334,7 +1590,12 @@ def cube_colors_interpreted_HSV(BGR_detected, HSV_detected):
     if HSV_analysis==False:
         cube_status_kociemba={}
         cube_status_detected={}
-    
+    else:
+        # see the matching comment in cube_colors_interpreted(): a center facelet's color is a structural fact
+        # of the cube (U's center is always white, etc.), not something to classify - force it here too.
+        for pos, color in CENTER_COLOR.items():
+            cube_status_kociemba[pos] = color
+
     # cube_status_kociemba uses the conventional colors for kociemba solver
     # cube_status_detected has the detected colors, via the HSV approach. This dict is used for decoration purpose
     return cube_status_kociemba, cube_status_detected, cube_color_sequence
@@ -1600,7 +1861,12 @@ def faces_collage(faces):
     resume_w=int(3*face_h*resume_ratio)     # resume image width is calculated from the imposed height, by keeping aspect ratio
     resume_resized = cv2.resize(faces[7], (resume_w, resume_h), interpolation = cv2.INTER_AREA) # resume is resized to occupy a full 'column'   
     
-    seq=[1,2,3,4,5,6]                       # faces order suggested to laptop camera follow kociemba order
+    # faces[] is keyed by SCAN STEP (1-6, whatever order 'sides' presented the faces in), but this collage's
+    # column layout is laid out by KOCIEMBA POSITION (U,R,F,D,L,B) - look up which scan step captured each
+    # position, rather than assuming scan step N was always kociemba position N (true only for the original
+    # U,R,F,D,L,B scan order; not for any other order sides may now present the faces in).
+    step_for_letter = {letter: step for step, letter in sides.items() if step != 0}
+    seq = [step_for_letter[letter] for letter in ('U', 'R', 'F', 'D', 'L', 'B')]
 
     col1=np.vstack([empty_face, faces[seq[4]], empty_face])        # vertical stack of images, to generate 1st column for the pictures collage
     col2=np.vstack([faces[seq[0]], faces[seq[2]], faces[seq[3]]])  # vertical stack of images, to generate 2nd column for the pictures collage
@@ -1662,14 +1928,12 @@ def cube_solution(cube_string):
 
 
 def text_bg(frame, w, h):
-    ''' Generates a black horizontal bandwith at frame top and bottom, as backgroung for the text.
-    This is usefull to provide guidance/feedback text on screen to the user.'''
-    
+    ''' Sets background_h, a small top/bottom margin that keeps the detection zone off the very edges of the
+    frame. Instructions/status text now live in the sidebar (see render_sidebar()), not painted over the
+    camera view, so this no longer draws anything - it only keeps the margin value other code relies on.'''
+
     global background_h                                                 # this variable is re-used to reduce the frame to a ROI
-    background_h=42                                                     # height of a black bandwidth used as back ground for text
-    
-    cv2.rectangle(frame, (0, 0), (w, background_h), (0,0,0), -1)        # black background bandwidth at frame top
-    cv2.rectangle(frame, (0, h-background_h), (w, h), (0,0,0), -1)      # black background bandwidth at frame bottom
+    background_h=20                                                     # small margin, kept off the very top/bottom edge
 
 
 
@@ -1687,9 +1951,376 @@ def text_font():
     return font, fontScale, fontColor, lineType
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Modern window layout: the 'cube' window is a camera-view block (clean video feed, no text burned onto it)
+# with a sidebar block to its right holding a title/status line, plain-language instructions, a compact
+# per-face capture-progress strip, and clickable buttons - a mouse click on a button is translated to the
+# same action a keyboard shortcut would trigger, so both stay in sync automatically.
+# ---------------------------------------------------------------------------------------------------------
+
+SIDEBAR_W = 320
+TOP_BTN_H = 34                   # slightly shorter than the main 42px action buttons - a visibly distinct,
+                                  # secondary-feeling slot for a standalone setup action like "Calibrate colors"
+SIDEBAR_BG = (247, 247, 245)     # BGR, light neutral background
+TEXT_PRIMARY = (35, 35, 35)
+TEXT_SECONDARY = (110, 110, 110)
+ACCENT = (200, 120, 30)          # BGR blue accent, for the primary button
+ACCENT_ACTIVE = (175, 100, 15)   # darker, for hover/press feedback
+DANGER = (60, 60, 210)           # BGR red, for quit
+DANGER_ACTIVE = (45, 45, 180)
+BTN_SECONDARY_BG = (222, 222, 222)
+BTN_SECONDARY_ACTIVE = (200, 200, 200)
+DIVIDER = (216, 216, 214)
+INSTRUCTION_BLOCK_H = 104   # fixed height reserved for the instructions block: 2 items x up to 2 wrapped lines
+                            # each (2*22) + the 8px per-item gap, regardless of how much a given state's text
+                            # actually needs - keeps the sidebar layout (and window size) identical across
+                            # states even when their instruction text wraps to different line counts
+
+current_button_rects = {}   # {'accept': (x1,y1,x2,y2), ...} in FULL composed-canvas coordinates
+mouse_clicked_action = None  # set by on_cube_mouse(), consumed (and cleared) once per main-loop iteration
+hover_action = None           # action name currently under the mouse, or None; drives the button hover highlight
 
 
+try:                              # best-effort real hand cursor on hover (Windows only; harmless no-op elsewhere).
+    import ctypes                 # cv2 itself has no per-region cursor API, but the window is a normal Win32
+    _user32 = ctypes.windll.user32  # window underneath, so its cursor can still be set directly via user32 -
+    _IDC_ARROW, _IDC_HAND = 32512, 32649   # this has to be re-asserted on every mouse move (not just on
+except Exception:                          # hover/unhover transitions), since Windows' own window procedure
+    _user32 = None                         # resets it to the default arrow in between our calls otherwise.
 
+
+def _set_windows_hand_cursor(is_hand):
+    if _user32 is None:
+        return
+    try:
+        _user32.SetCursor(_user32.LoadCursorW(0, _IDC_HAND if is_hand else _IDC_ARROW))
+    except Exception:
+        pass
+
+
+def on_cube_mouse(event, x, y, flags, param):
+    ''' Mouse callback for the 'cube' window: a left click inside one of the sidebar's current button
+    rectangles (tracked in current_button_rects, refreshed every frame by compose_and_show()) sets
+    mouse_clicked_action to that button's action name, for the main loop to act on alongside keypresses.
+    Also drives two hover cues: a real Windows hand cursor (_set_windows_hand_cursor(), best-effort - cv2
+    itself has no per-region cursor API) and a highlighted button fill (hover_action, drawn by draw_button()
+    next frame) as a visible fallback wherever the cursor swap doesn't apply (non-Windows, or if it silently
+    fails).'''
+
+    global mouse_clicked_action, hover_action
+    if event == cv2.EVENT_LBUTTONDOWN:
+        for action, (x1, y1, x2, y2) in current_button_rects.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                mouse_clicked_action = action
+                break
+    elif event == cv2.EVENT_MOUSEMOVE:
+        hover_action = None
+        for action, (x1, y1, x2, y2) in current_button_rects.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                hover_action = action
+                break
+        _set_windows_hand_cursor(hover_action is not None)
+
+
+DISABLED_BTN_BG = (235, 235, 235)   # BGR, near-invisible against the sidebar background
+DISABLED_BTN_FG = (190, 190, 190)
+
+
+def draw_button(img, rect, label, style, font, hovered=False, enabled=True):
+    ''' Draws one button (a filled rounded-ish rectangle with a centered label) at rect=(x1,y1,x2,y2).
+    style: 'primary' (accent-filled), 'danger' (red-filled), or 'secondary' (light gray).
+    hovered: draws it in its active-style shade (same look a real button gives on mouse-over) - the closest
+    substitute available for a hand cursor, which cv2 windows can't show per-region.
+    enabled=False: draws it faded/inert instead of hiding it - the sidebar's button set stays constant across
+    every scanning state (only which ones are clickable changes), so the window never needs to resize or
+    have controls appear/disappear as you move between states.'''
+
+    x1, y1, x2, y2 = rect
+    if not enabled:
+        bg, fg = DISABLED_BTN_BG, DISABLED_BTN_FG
+    elif hovered:
+        bg = ACCENT_ACTIVE if style == 'primary' else (DANGER_ACTIVE if style == 'danger' else BTN_SECONDARY_ACTIVE)
+        fg = (255, 255, 255) if style in ('primary', 'danger') else TEXT_PRIMARY
+    else:
+        bg = ACCENT if style == 'primary' else (DANGER if style == 'danger' else BTN_SECONDARY_BG)
+        fg = (255, 255, 255) if style in ('primary', 'danger') else TEXT_PRIMARY
+    cv2.rectangle(img, (x1, y1), (x2, y2), bg, -1)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (200, 200, 200), 1, cv2.LINE_AA)
+    (tw, th), _ = cv2.getTextSize(label, font, 0.62, 1)
+    cv2.putText(img, label, (x1+(x2-x1-tw)//2, y1+(y2-y1+th)//2), font, 0.62, fg, 1, cv2.LINE_AA)
+
+
+def wrap_text(text, max_chars):
+    ''' Simple word-wrap: splits text into lines no longer than max_chars, breaking on spaces.'''
+
+    words = text.split(' ')
+    lines, cur = [], ''
+    for word in words:
+        trial = (cur+' '+word).strip()
+        if len(trial) > max_chars and cur:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def compute_face_progress():
+    ''' Returns {face_letter: display_bgr} for each cube face captured so far this scan (average of its 9
+    facelets, classified to one of the 6 predefined colors), used for the sidebar's progress strip.'''
+
+    progress = {}
+    for i in range(len(BGR_mean)//9):
+        letter = sides[i+1]
+        face_bgrs = BGR_mean[i*9:(i+1)*9]
+        avg = tuple(int(sum(c[k] for c in face_bgrs)/9) for k in range(3))
+        progress[letter] = classify_bgr_to_6(avg)[1]
+    return progress
+
+
+def render_face_net(img, x0, y0, edge, font, current_letter, captured_letters, face_colors=None, clickable=False):
+    ''' Draws the 6 cube faces as their standard unfolded-net layout (U on top, L-F-R-B in a row, D on the
+    bottom - the same layout as a real cube's faces adjoin each other), so a face letter maps to a color and
+    a position at a glance instead of needing to be memorized. Each cell shows face_colors[letter] if given
+    (e.g. the actually captured color, for the post-scan review screen), else its standard reference color
+    (U=white, R=red, F=green, D=yellow, L=orange, B=blue). The face currently being requested gets a thick
+    accent border; already-captured faces get a small dot badge. clickable=True (the review screen's
+    click-to-rescan) also highlights whichever cell is currently under the mouse (see hover_action), the same
+    substitute-for-a-hand-cursor treatment draw_button() gives regular buttons.
+    Returns (width, height, cell_rects) - cell_rects is {letter: (x1,y1,x2,y2)} in img-local coordinates, for
+    callers that want the cells themselves to be clickable (e.g. click-to-rescan on the review screen).'''
+
+    cell_rects = {}
+    for letter, (col, row) in NET_LAYOUT.items():
+        x, y = x0+col*edge, y0+row*edge
+        cell_rects[letter] = (x, y, x+edge, y+edge)
+        std_color_name = STD_LETTER_COLOR[letter]
+        color = (face_colors or {}).get(letter, DEFAULT_REF_COLORS[std_color_name])
+        is_hovered = clickable and hover_action == f'rescan_{letter}'
+        if is_hovered:                                # dim the fill slightly: same visual language as a hovered button
+            color = tuple(max(0, c-45) for c in color)
+        cv2.rectangle(img, (x, y), (x+edge, y+edge), color, -1)
+        is_current = letter == current_letter
+        border_color = ACCENT if is_current else ((90, 90, 90) if is_hovered else (150, 150, 150))
+        border_w = 3 if (is_current or is_hovered) else 1
+        cv2.rectangle(img, (x, y), (x+edge, y+edge), border_color, border_w, cv2.LINE_AA)
+        dark_bg = std_color_name in ('white', 'yellow')
+        txt_color = TEXT_PRIMARY if dark_bg else (255, 255, 255)
+        (tw, th), _ = cv2.getTextSize(letter, font, 0.55, 1)
+        cv2.putText(img, letter, (x+(edge-tw)//2, y+(edge+th)//2), font, 0.55, txt_color, 1, cv2.LINE_AA)
+        if letter in captured_letters:               # small dot badge in the corner, clear of the center letter
+            cv2.circle(img, (x+edge-8, y+8), 4, txt_color, -1, cv2.LINE_AA)
+            cv2.circle(img, (x+edge-8, y+8), 4, (90, 90, 90), 1, cv2.LINE_AA)
+
+    return 4*edge, 3*edge, cell_rects
+
+
+def render_sidebar(height, font, title, instructions, buttons, face_progress, preview_face=None, current_letter=None,
+                    face_colors=None, clickable_net=False, net_edge=40, top_button=None, editable_preview=False):
+    ''' Renders the sidebar panel (SIDEBAR_W x height): title, an optional standalone setup action (top_button
+    - visually separated by its own thin divider, since it's a different kind of action from the scan flow
+    below it, e.g. "Calibrate colors"), instructions (list of strings, word-wrapped), a 3x3 preview of a
+    just-captured face's 9 classified colors (blank placeholder cells when preview_face is None, so this
+    block always takes the same space), the 6-face unfolded-net map (see render_face_net() - shows which
+    color/position each face letter is, and highlights current_letter as the one to show now), and a stack of
+    buttons at the bottom.
+    buttons/top_button: (action, label, style) or (action, label, style, enabled) tuples - enabled defaults to
+    True; a disabled button is drawn faded and doesn't register a click, but still takes up its normal space,
+    so the whole sidebar's layout (and therefore the window size) stays constant across every state - only
+    which buttons are usable changes. This also means the button SET passed in should be the same across
+    every state a given screen cycles through (e.g. the whole scan loop), just with different enabled flags.
+    face_colors: {letter: display_bgr} to show each net cell's actually-captured color instead of the fixed
+    reference (used by the post-scan review screen). clickable_net: when True, the net's 6 cells are added to
+    the returned rects too, as actions 'rescan_U'/'rescan_R'/etc, so a click on a face triggers rescanning it.
+    editable_preview: when True (and preview_face is not None), each of the 9 preview cells is added to the
+    returned rects as 'edit_0'..'edit_8', so a click on one facelet can cycle its color without a full rescan.
+    Returns (sidebar_img, button_rects) where button_rects is {action: (x1,y1,x2,y2)} in sidebar-local
+    coordinates (compose_and_show() offsets these into full-canvas coordinates for click detection).'''
+
+    img = np.full((height, SIDEBAR_W, 3), SIDEBAR_BG, dtype=np.uint8)
+    rects = {}
+
+    y = 34
+    cv2.putText(img, title, (20, y), font, 0.8, TEXT_PRIMARY, 2, cv2.LINE_AA)
+    y += 18
+    cv2.line(img, (20, y), (SIDEBAR_W-20, y), DIVIDER, 1, cv2.LINE_AA)
+    y += 20
+
+    if top_button is not None:
+        action, label, style = top_button[0], top_button[1], top_button[2]
+        enabled = top_button[3] if len(top_button) > 3 else True
+        rect = (20, y, SIDEBAR_W-20, y+TOP_BTN_H)
+        draw_button(img, rect, label, style, font, hovered=(enabled and action == hover_action), enabled=enabled)
+        if enabled:
+            rects[action] = rect
+        y += TOP_BTN_H+10
+        cv2.line(img, (20, y), (SIDEBAR_W-20, y), DIVIDER, 1, cv2.LINE_AA)
+        y += 20
+
+    # instructions get a FIXED block height (INSTRUCTION_BLOCK_H) regardless of how many lines this particular
+    # state's text actually wraps to, so differing text length across states can't shift the layout below it
+    # by a few pixels and force yet another window resize - shorter text just leaves blank space beneath it.
+    instr_y0 = y
+    for line in instructions:
+        for wrapped in wrap_text(line, 34):
+            cv2.putText(img, wrapped, (20, y), font, 0.55, TEXT_SECONDARY, 1, cv2.LINE_AA)
+            y += 22
+        y += 8
+    y = instr_y0 + INSTRUCTION_BLOCK_H
+
+    y += 6
+    label = 'Captured colors (click to fix one)' if editable_preview else 'Captured colors'
+    cv2.putText(img, label, (20, y), font, 0.5, TEXT_SECONDARY, 1, cv2.LINE_AA)
+    y += 12
+    cell = 30
+    for row in range(3):
+        for col in range(3):
+            idx = row*3+col
+            cx, cy = 20+col*cell, y+row*cell
+            col_bgr = preview_face[idx] if preview_face is not None else SIDEBAR_BG
+            action = f'edit_{idx}'
+            hovered = editable_preview and preview_face is not None and hover_action == action
+            cv2.rectangle(img, (cx, cy), (cx+cell-2, cy+cell-2), col_bgr, -1)
+            border_color = (90, 90, 90) if hovered else (170, 170, 170)
+            cv2.rectangle(img, (cx, cy), (cx+cell-2, cy+cell-2), border_color, 2 if hovered else 1, cv2.LINE_AA)
+            if editable_preview and preview_face is not None:
+                rects[action] = (cx, cy, cx+cell-2, cy+cell-2)
+    y += 3*cell+14
+
+    y += 2
+    cv2.putText(img, 'Face map', (20, y), font, 0.55, TEXT_SECONDARY, 1, cv2.LINE_AA)
+    y += 12
+    net_w, net_h, net_cell_rects = render_face_net(img, 20, y, net_edge, font, current_letter,
+                                                     set(face_progress.keys()), face_colors, clickable_net)
+    y += net_h+14
+
+    if clickable_net:
+        rects.update({f'rescan_{letter}': rect for letter, rect in net_cell_rects.items()})
+
+    btn_h, btn_gap = 42, 12
+    by = height - 20 - len(buttons)*(btn_h+btn_gap) + btn_gap
+    for button in buttons:
+        action, label, style = button[0], button[1], button[2]
+        enabled = button[3] if len(button) > 3 else True
+        rect = (20, by, SIDEBAR_W-20, by+btn_h)
+        draw_button(img, rect, label, style, font, hovered=(enabled and action == hover_action), enabled=enabled)
+        if enabled:
+            rects[action] = rect
+        by += btn_h+btn_gap
+
+    return img, rects
+
+
+last_canvas_size = None   # (w, h) of the last canvas shown; compose_and_show() resizes the window when this changes
+
+
+def compose_and_show(camera_frame, sidebar_img, sidebar_rects):
+    ''' Horizontally joins the camera view and the sidebar into one canvas, updates the global
+    current_button_rects (offset into full-canvas coordinates, for on_cube_mouse() to hit-test against),
+    and shows the result in the 'cube' window. Returns the composed canvas.
+
+    cv2's WINDOW_NORMAL always stretches whatever's shown to exactly fill the window's current rect, with no
+    letterboxing. The composed canvas's own height varies by state (the accept/retry screen needs more room
+    than plain scanning - see estimate_sidebar_height()), but the window itself only gets resized once at
+    startup; on every later state change the canvas no longer matches the window's size, so it gets visibly
+    stretched. Fix: whenever the canvas's own pixel size changes, resize the window to match it exactly (1:1,
+    no scaling) before showing it. A user who then manually drags the window will still see it stretch until
+    the next state change resyncs it - that's an explicit user action, not a bug in what we draw.'''
+
+    global current_button_rects, last_canvas_size
+    canvas = np.hstack([camera_frame, sidebar_img])
+    cam_w = camera_frame.shape[1]
+    current_button_rects = {a: (x1+cam_w, y1, x2+cam_w, y2) for a, (x1, y1, x2, y2) in sidebar_rects.items()}
+
+    canvas_size = (canvas.shape[1], canvas.shape[0])   # (w, h)
+    if canvas_size != last_canvas_size:
+        try:
+            cv2.resizeWindow('cube', canvas_size[0], canvas_size[1])
+        except Exception:
+            pass
+        last_canvas_size = canvas_size
+
+    cv2.imshow('cube', canvas)
+    return canvas
+
+
+MIN_SIDEBAR_H = 250   # hard floor: below this even the lightest state (title + one line) wouldn't fit
+
+
+def estimate_sidebar_height(instructions, buttons, preview_face, net_edge=40, top_button=None):
+    ''' Mirrors render_sidebar()'s own top-down layout arithmetic (title/divider, optional top_button,
+    instructions, 3x3 preview, face map, buttons) to compute exactly how tall the sidebar needs to be.
+    preview_face no longer changes this (that block is always reserved now, whether or not there's a preview
+    to show, precisely so this height - and therefore the window size - stays constant across every state of
+    a given screen instead of resizing/jumping around; the parameter is kept only so callers don't need
+    updating). If render_sidebar()'s layout constants change, keep these in sync.'''
+
+    y = 34+18+20                                     # title + divider
+    if top_button is not None:
+        y += TOP_BTN_H+10+20                          # top button + its own divider
+    y += INSTRUCTION_BLOCK_H                          # instructions: fixed block, regardless of actual wrap count
+    y += 6+12+3*30+14                                # "Captured colors" label + 3x3 grid (cell=30), always reserved
+    y += 2+12                                        # "Face map" label
+    y += 3*net_edge+14                                # net + margin
+    y += 8 + len(buttons)*42 + max(0, len(buttons)-1)*12  # buttons block + its own bottom margin
+    return y
+
+
+def show_cube_frame(camera_frame, cam_h, title, instructions, buttons, preview_face=None, current_letter=None,
+                     face_colors=None, clickable_net=False, net_edge=40, top_button=None, editable_preview=False):
+    ''' Convenience wrapper for the common case: render the sidebar for the given state (title, optional
+    top_button - a standalone setup action visually separated from the scan flow, e.g. "Calibrate colors" -
+    instruction lines, buttons, optional 3x3 just-captured-face preview, optional current_letter to highlight
+    in the face map), and compose+display it against camera_frame.
+    camera_frame/cam_h are taken as explicit arguments (not read off a global) since several callers
+    (window_for_cube_rotation(), calibrate_cube_colors()) keep their own local frame/h that never gets
+    written back to the module-level globals - reading those here would silently show a stale frame.
+    Used at every point in cubeAF() (and the other window-driving functions) that used to just call
+    cv2.imshow('cube', frame).'''
+
+    canvas_h = max(cam_h, MIN_SIDEBAR_H, estimate_sidebar_height(instructions, buttons, preview_face, net_edge, top_button))
+    if canvas_h != cam_h:            # camera view doesn't match the sidebar's required height: scale it to fit,
+        scale = canvas_h/cam_h       # preserving aspect ratio (no distortion) - a slightly-zoomed-in live feed
+        new_w = int(camera_frame.shape[1]*scale)         # reads better than a large dead gray bar underneath it
+        interp = cv2.INTER_LINEAR if scale > 1 else cv2.INTER_AREA
+        camera_frame = cv2.resize(camera_frame, (new_w, canvas_h), interpolation=interp)
+
+    sidebar_img, rects = render_sidebar(canvas_h, font, title, instructions, buttons, compute_face_progress(),
+                                         preview_face, current_letter, face_colors, clickable_net, net_edge,
+                                         top_button, editable_preview)
+    compose_and_show(camera_frame, sidebar_img, rects)
+
+
+ACTION_TO_KEY = {'accept': 32, 'proceed': 32, 'sample': 32, 'retry': ord('r'), 'quit': 27, 'calibrate': ord('c'), 'cancel': 27}
+
+
+def poll_key(wait_ms):
+    ''' Like cv2.waitKey(wait_ms), but also folds in a pending sidebar button click (see on_cube_mouse()),
+    translating it to the same key code the equivalent keyboard shortcut would produce - so every existing
+    key==... check elsewhere keeps working unchanged for both input methods. A click takes priority over
+    whatever key(if any) was simultaneously pressed, and is consumed (cleared) either way.'''
+
+    global mouse_clicked_action
+    key = cv2.waitKey(wait_ms)
+    if mouse_clicked_action is not None:
+        key = ACTION_TO_KEY.get(mouse_clicked_action, key)
+        mouse_clicked_action = None
+    return key
+
+
+def poll_action(wait_ms):
+    ''' Like poll_key(), but returns the raw clicked action name too (key, action), for screens with actions
+    that have no single keyboard-shortcut equivalent - e.g. the review screen's 6 different 'rescan_<letter>'
+    actions, one per clickable face in the map, which poll_key()'s one-action-to-one-key translation can't
+    represent.'''
+
+    global mouse_clicked_action
+    key = cv2.waitKey(wait_ms)
+    action = mouse_clicked_action
+    mouse_clicked_action = None
+    return key, action
 
 
 def average_color(image, x, y):
@@ -1733,10 +2364,134 @@ def average_color(image, x, y):
         contour = [pts]                  # list is made with the array of coordinates
         cv2.drawContours(frame, contour, -1, (230, 230, 230), 2)  # a white polyline is drawn on the contour (2 px thickness)
     
-    #Return the sqrt of the mean of squared B, G, and R sums 
+    #Return the sqrt of the mean of squared B, G, and R sums
     return (int(math.sqrt(blue/num)), int(math.sqrt(green/num)), int(math.sqrt(red/num)))
 
 
+def robust_facelet_color(image, x, y):
+    ''' Samples a facelet's color from 5 small patches (dead-center plus the 4 diagonal quadrants, all safely
+    within the facelet) instead of only dead-center, and returns their per-channel median.
+    A cube's center pieces very often carry a small manufacturer logo printed right in the middle of the
+    sticker; sampling only dead-center risks averaging in that logo's ink instead of the sticker's actual
+    color (this is what made a solved white face's center read as blue). The median of several patches shrugs
+    off any one patch being corrupted by a logo, glare, or scratch, without needing to special-case which
+    facelets are centers.'''
+
+    global edge
+    patch = max(4, edge//2)          # small sampling half-size per patch, so an off-center patch mostly clears a centered logo
+    off = edge                       # how far off-center the 4 diagonal patches sit
+    offsets = [(0, 0), (-off, -off), (off, -off), (-off, off), (off, off)]
+
+    samples = []
+    for dx, dy in offsets:
+        region = image[y+dy-patch:y+dy+patch, x+dx-patch:x+dx+patch]
+        if region.size == 0:
+            continue
+        samples.append((float(np.mean(region[:,:,0])), float(np.mean(region[:,:,1])), float(np.mean(region[:,:,2]))))
+
+    return (int(statistics.median(s[0] for s in samples)),
+            int(statistics.median(s[1] for s in samples)),
+            int(statistics.median(s[2] for s in samples)))
+
+
+def load_color_calibration():
+    ''' Loads a previously saved color calibration from disk, if present, into the global calibrated_colors
+    dict. Ported from kkoomen/qbr's calibrate mode: measuring the 6 colors directly off the user's own cube,
+    under their own lighting, once - rather than only ever relying on whatever the live scan's center facelets
+    happen to read - gives color classification a much more reliable starting point.'''
+
+    global calibrated_colors
+    calibrated_colors = {}
+    if os.path.exists(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE, 'r') as f:
+                data = json.load(f)
+            calibrated_colors = {color: tuple(bgr) for color, bgr in data.items()}
+            print(f'\nLoaded color calibration from {CALIBRATION_FILE}: {calibrated_colors}')
+        except Exception as ex:
+            print(f'\nCould not load color calibration ({ex}), starting uncalibrated')
+            calibrated_colors = {}
+
+
+def save_color_calibration():
+    ''' Persists the global calibrated_colors dict to disk, so it's automatically reloaded next run.'''
+
+    try:
+        with open(CALIBRATION_FILE, 'w') as f:
+            json.dump({color: list(bgr) for color, bgr in calibrated_colors.items()}, f)
+        print(f'\nSaved color calibration to {CALIBRATION_FILE}')
+    except Exception as ex:
+        print(f'\nCould not save color calibration: {ex}')
+
+
+def classify_bgr_to_6(bgr):
+    ''' Classifies a raw captured BGR color into the nearest of the 6 known cube colors (white, red, green,
+    yellow, orange, blue), via CIEDE2000 distance in Lab space against calibrated_colors if available, else
+    the DEFAULT_REF_COLORS fallback palette. Returns (color_name, display_bgr).
+    display_bgr is always DEFAULT_REF_COLORS[color_name] - a clean, bright, fixed BGR - regardless of which
+    reference set decided the match: calibrated_colors is only ever used to decide WHICH of the 6 names is
+    closest, never as the color painted on screen. A bad/dim calibration sample would otherwise get painted
+    back verbatim on every facelet classified to that color, looking like none of the 6 predefined colors at
+    all - exactly what showed up when an early, logo-skewed calibration was in use.'''
+
+    ref = calibrated_colors if len(calibrated_colors) == 6 else DEFAULT_REF_COLORS
+    B, G, R = bgr
+    lab_meas = rgb2lab([R, G, B])
+    best_color, best_dist = None, None
+    for color, (rb, rg, rr) in ref.items():
+        lab_ref = rgb2lab([rr, rg, rb])
+        dist = CIEDE2000(tuple(lab_meas), tuple(lab_ref))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_color = color
+    return best_color, DEFAULT_REF_COLORS[best_color]
+
+
+def calibrate_cube_colors():
+    ''' Interactive calibration: for each of the 6 cube colors in turn, show that color to the camera and
+    press SPACE to sample it (the center facelet of whatever 3x3 grid is currently detected). ESC cancels
+    without changing the existing calibration. On completion, updates the global calibrated_colors dict and
+    persists it to disk. Ported from kkoomen/qbr's calibrate mode.'''
+
+    global calibrated_colors, frame, w, h
+    colors_to_calibrate = ['white', 'green', 'yellow', 'orange', 'red', 'blue']   # same order as the scan (sides dict)
+    new_calibration = {}
+
+    for step, color_name in enumerate(colors_to_calibrate):
+        sampled = False
+        while not sampled:
+            frame, w, h = read_camera()
+            rects = detect_in_fixed_zone(frame, w, h)
+            ready = len(rects) == 9
+            hint = 'Zone is green - press SAMPLE.' if ready else 'Fill the frame with that color until the box turns green.'
+            show_cube_frame(frame, h, f'Calibrate ({step+1}/6): {color_name.upper()}', [hint],
+                             [('sample', 'Sample', 'primary' if ready else 'secondary'), ('cancel', 'Cancel', 'danger')])
+            key = poll_key(30)
+            try:
+                window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+            except:
+                window_closed = False
+            if window_closed or key == 27:
+                print('\nColor calibration cancelled')
+                return False
+
+            if key == 32 and ready:
+                cx, cy, cw, ch = rects[4]       # center facelet, index 4 of the 9 in reading order
+                bgr = robust_facelet_color(frame, cx + cw//2, cy + ch//2)
+                new_calibration[color_name] = tuple(int(c) for c in bgr)
+                sampled = True
+
+    calibrated_colors = new_calibration
+    save_color_calibration()
+
+    # on-screen confirmation, not just a terminal print - the terminal isn't always what's being watched
+    end_time = time.time() + 1.5
+    while time.time() < end_time:
+        frame, w, h = read_camera()
+        show_cube_frame(frame, h, 'Calibration saved!', [f'Saved to {os.path.basename(CALIBRATION_FILE)}'], [])
+        cv2.waitKey(30)
+
+    return True
 
 
 
@@ -1751,26 +2506,14 @@ def read_color(facelets, candidates, BGR_mean, H_mean, wait=20, index=0):
     for facelet in facelets:                              # iteration over the 9 facelets just detedcted
         contour = facelet.get('contour')                  # contour of the facelet under analysis
         candidates.append(contour)                        # new contour is added to the candidates list
-        mask = np.zeros(frame.shape[:2], dtype='uint8')   # mask of zeros is made for the frame shape dimension
-        cv2.drawContours(mask, [contour], -1, 255, -1)    # mask is applied to vsualize one facelet at the time
-        
-
-        roi = cv2.bitwise_and(frame, frame, mask=mask)    # ROI is used to shortly display one facelet at the time
-        
         cm_point=facelet['cx'],facelet['cy']                              # contour center coordinate
-        bgr_mean_sq = average_color(frame, facelet['cx'], facelet['cy'])  # color is averaged with sqr sum os squares
+        bgr_mean_sq = robust_facelet_color(frame, facelet['cx'], facelet['cy'])  # median of several patches, robust to a center logo
         BGR_mean.append(bgr_mean_sq)                          # Initially used a simpler mean to average the facelet color
         b,g,r = bgr_mean_sq                                   # BGR (avg) components are retrieved
         BGR_mean_sq = np.array([[[b,g,r]]], dtype=np.uint8)   # BGR are positioned in cv2 array form
         hsv = cv2.cvtColor( BGR_mean_sq, cv2.COLOR_BGR2HSV)   # HSV color space equilavent values, for the average facelet color
         hue, s, v = cv2.split(hsv)                            # HSV components are retrieved
         H_mean.append((hue[0][0]))                            # the (avg) Hue value is stored on a list
-        
-#         if fixWindPos:                   # case the fixWindPos variable is set true on __main__ 
-#             cv2.namedWindow('cube')      # create the cube window
-#             cv2.moveWindow('cube', 0,0)  # move the window to (0,0)
-        cv2.imshow('cube', roi)          # ROI is shortly display one facelet at the time
-        cv2.waitKey(20)                  # this waiting time is meant as decoration to see each facelet being detected
 
         # a progressive facelet numer, 1 to 9, is placed over the facelets
         cv2.putText(frame, str(index+1), (int(facelet.get('cx'))-12, int(facelet.get('cy'))+6), font, fontScale,(0,0,0),lineType)
@@ -1872,9 +2615,7 @@ def face_image(frame, facelets, side, faces):
         frame_width = cube_width+2*margin
     elif side>1:
         faces[side] = cv2.resize(faces[side], (frame_width, frame_width), interpolation=cv2.INTER_LINEAR)
-    
-    cv2.imshow('cube', faces[side])
-    
+
     return faces
 
 
@@ -1898,9 +2639,11 @@ def window_for_cube_rotation(w, h, side, frame):
 
     # a camera reading now prevents from re-using the previous frame, therefore from re-capturing the same facelets twice
     frame, w, h = read_camera()
-    
-    cv2.imshow('cube', frame)       # frame is showed to viewer
-    
+
+    show_cube_frame(frame, h, f'Next: side {sides[side]}', ['Turn the cube to show the highlighted face.'],
+                     [('quit', 'Close', 'danger')], current_letter=sides[side],
+                     top_button=('calibrate', 'Calibrate colors', 'secondary'))
+
     return side                     # return the new cube side to be anayzed
 
 
@@ -1914,35 +2657,29 @@ def window_for_cube_solving(solution_Text, w, h, side, frame):
     The window allows the user to see the Kociemba solution on screen, and to keep life the cube resolution.
     When this function is active, facelets contours aren't searched ! '''
     
-    font_k = 1
-
     while quitting == False:
         frame, w, h=read_camera()            # video stream and frame dimensions
-        text_bg(frame, w, h)                 # generates a rectangle as backgroung for text in Frame
 
-        if solution_Text != 'Error':         # case when no error retrieved from the Kociemba solver
-            if solution_Text == '0 moves  ': # case when no cube movements are needed
-                cv2.putText(frame, str(f'THE CUBE IS SOLVED'), (10,30), font, fontScale*font_k,fontColor,lineType)
-            else:                            # case when at cube movements are needed
-                font_k = 0.55                # smaller font is set, to accomodate up to 10 (or 21) movements
-                cv2.putText(frame, str(f'{solution_Text}'), (10,30), font, fontScale*font_k,fontColor,lineType)
+        if solution_Text == 'Error':
+            title, instr = 'Error', ['Incoherent cube detection.', 'Recalibrate colors and rescan.']
+        elif solution_Text == '0 moves  ':
+            title, instr = 'The cube is solved!', ['Nothing to do.']
+        else:
+            title, instr = 'Solution', [solution_Text]
 
-        elif solution_Text == 'Error':       # case when error is retrieved from the Kociemba solver
-            font_k = 0.75                    # font size is set, to accomodate the error message
-            error_msg = 'Error: Incoherent cube detection' # error message
-            cv2.putText(frame, str(f'{error_msg}'), (10,30), font, fontScale*font_k,fontColor,lineType)
-
-
-        font_k = 1
-        cv2.putText(frame, str('ESC to escape, spacebar to proceed'), (10, int(h-12)), font, fontScale*font_k,fontColor,lineType)
-        cv2.imshow('cube', frame)        # frame is showed to viewer
-        key=cv2.waitKey(10)              # frame is refresched every 10ms, until keyboard
+        show_cube_frame(frame, h, title, instr,
+                         [('proceed', 'Continue', 'primary'), ('quit', 'Close', 'danger')],
+                         top_button=('calibrate', 'Calibrate colors', 'secondary'))
+        key=poll_key(10)                 # frame is refresched every 10ms, until keyboard/sidebar-button click
 
         if cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) <1 or (key == 27): # X on top bar or ESC button
             quit_func()                  # quitting function
             break
 
-        if key == 32:               # spacebar is used to move on to the next cube's side   
+        if key in (ord('c'), ord('C')):  # enters interactive color calibration
+            calibrate_cube_colors()
+
+        if key == 32:               # spacebar is used to move on to the next cube's side
 #             clear_terminal()        # cleares the terminal
             side=0                  # cube side is set to zero to start a new cycle
             BGR_mean.clear()        # empties the dict previoously filled with 54 facelets colors
@@ -1988,6 +2725,8 @@ def quit_func():
     
     try:                             # tentative
         cv2.destroyAllWindows()      # all cv2 windows are removed
+        cv2.waitKey(1)               # on Windows, destroyAllWindows() needs a following waitKey to actually flush,
+                                      # otherwise the last frame can stay stuck on screen looking like a frozen app
     except:                          # case of exception raised
         pass                         # do nothing
     
@@ -2034,19 +2773,27 @@ def start_up(cam_num, cam_width, cam_height, cam_crop_at_right, cam_facelets):
     
     # global variables
     global font, fontScale, fontColor, lineType, camera, width, height, sv, quitting
-    global sides, side, BGR_mean, H_mean, kociemba_facelets_BGR_mean, edge, offset, faces, w, h, background_h
+    global sides, side, BGR_mean, H_mean, kociemba_facelets_BGR_mean, edge, deco_edge, offset, faces, w, h, background_h
     global clear_output, first_cycle, plt, k_kernel, d_iterations, e_iterations, facelets_in_width, crop_at_right
     global solution_Text
 
-    
+
     side=0                           # set the initial cube side (cube sides are 1 to 6, while zero is used as starting for other setting)
     first_cycle=True                 # variable to be used only at first program loop
-    
+
     # webcam relevant info are returned after cropping, resizing, etc
     camera, width, height = webcam(cam_num, cam_width, cam_height)
     crop_at_right = cam_crop_at_right  # picture cropping at the right side
-    edge = 14                       # edge dimension of each facelet used on cube sketches
-    sides={0:'Empty', 1:'U', 2:'R', 3:'F', 4:'D', 5:'L', 6:'B'}  # kociemba side order to follow, while detecting facelets colors
+    edge = 14                       # edge dimension of each facelet used on cube sketches, and half-side of the color sampling box
+    # deco_edge scales the on-screen Reference/Detected/Interpreted sketches (and the end-of-scan collage) so their
+    # fixed layout (29*deco_edge tall) always fits the actually negotiated camera height, instead of getting silently
+    # clipped by cv2 below the visible frame on shorter resolutions. It never affects color sampling (that stays 'edge').
+    deco_edge = max(8, min(edge, int(height/29)))
+    # scan order: white(U), green(F), yellow(D), orange(L), red(R), blue(B) - a more natural physical roll
+    # (top, tilt-to-front, tilt-to-bottom, then the 3 remaining sides) than the raw kociemba U,R,F,D,L,B order.
+    # reorder_to_kociemba_position() re-sorts the captured data back into kociemba's expected position order
+    # once all 6 are in, so this can be any order without affecting solving correctness.
+    sides={0:'Empty', 1:'U', 2:'F', 3:'D', 4:'L', 5:'R', 6:'B'}
 
     # general parameters for facelet's edges detection
     k_kernel=5                      # parameter for the edge detection
@@ -2063,8 +2810,126 @@ def start_up(cam_num, cam_width, cam_height, cam_crop_at_right, cam_facelets):
     H_mean=[]                        # empty list to be fille18d with with 54 facelets HUE value, while reading cube status
     kociemba_facelets_BGR_mean=[]    # empty list to be filled with with 54 facelets colors, ordered according KOCIEMBA order
     faces={}                         # dictionary that store the image of each face
-    offset=int(13 * edge)            # left part of the frame not usable for cube facelet detection, as used to depict the cube sketches
+    offset=int(13 * deco_edge)       # left part of the frame not usable for cube facelet detection, as used to depict the cube sketches
     solution_Text = ''               # solution_Text is set to empty string
+    load_color_calibration()         # loads a previously saved color calibration from disk, if any
+
+
+
+
+def rescan_one_face(letter):
+    ''' Re-captures just one face (identified by its kociemba letter, e.g. 'F'), replacing its 9 entries in
+    BGR_mean at their correct scan-order position - used by the post-scan review screen's click-to-rescan, so
+    a single wrong face doesn't require redoing the whole 6-face scan. Reuses the same detection/accept-gate
+    building blocks the main scan loop uses. Returns True once a face is accepted, False if cancelled/quit.'''
+
+    global frame, w, h, BGR_mean
+
+    scan_order_letters = [sides[i] for i in range(1, 7)]
+    step = scan_order_letters.index(letter) + 1   # 1-based scan-step whose BGR_mean slice this letter occupies
+
+    det_face_time = time.time()
+    while True:
+        key = poll_key(100)
+        try:
+            window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+        except:
+            window_closed = False
+        if window_closed or key == 27:
+            return False
+
+        frame, w, h = read_camera()
+        contours, hierarchy = read_facelets(det_face_time, 1, True)   # proceed=True: no countdown, capture as soon as ready
+
+        if hierarchy is None:
+            show_cube_frame(frame, h, f'Rescan side {letter}',
+                             ['Hold that face inside the frame.', 'Wait for the box to turn green.'],
+                             [('cancel', 'Cancel', 'danger')], current_letter=letter)
+            continue
+
+        hierarchy = hierarchy[0]
+        facelets = []
+        for component in zip(contours, hierarchy):
+            contour, hier, corners = get_approx_contours(component)
+            if corners == 4:
+                facelets = get_facelets(facelets, contour, hier)
+        if len(facelets) != 9:
+            det_face_time = time.time()
+            continue
+        facelets = order_9points(facelets, new_center=[])
+
+        candidates, new_bgr, new_hue = [], [], []
+        read_color(facelets, candidates, new_bgr, new_hue)
+        preview_face = [classify_bgr_to_6(bgr)[1] for bgr in new_bgr]
+
+        retry = False
+        while True:
+            show_cube_frame(frame, h, f'Side {letter} rescanned',
+                             ['Check the colors, then accept or retry.'],
+                             [('accept', 'Accept', 'primary'), ('retry', 'Retry', 'secondary'), ('cancel', 'Cancel', 'danger')],
+                             preview_face, current_letter=letter)
+            key = poll_key(150)
+            try:
+                window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+            except:
+                window_closed = False
+            if window_closed or key == 27:
+                return False
+            if key == 32:
+                BGR_mean[(step-1)*9:step*9] = new_bgr    # replaces this face's slice in place, order preserved
+                return True
+            if key in (ord('r'), ord('R')):
+                retry = True
+                break
+
+        if retry:
+            det_face_time = time.time()
+            continue
+
+
+def review_scan():
+    ''' Shown once all 6 faces are captured, before solving: a large clickable face map (each cell shows that
+    face's actually captured color) lets the user rescan any face that looks wrong, rather than only being
+    able to accept-or-restart-from-scratch. Loops until Accept (returns True) or Quit (returns False).'''
+
+    global frame, w, h
+
+    net_edge = 40   # same size used throughout scanning, so the layout doesn't visibly jump when review starts
+    review_buttons = [('accept', 'Accept', 'primary'), ('quit', 'Close', 'danger')]
+    while True:
+        frame, w, h = read_camera()
+
+        face_colors = {}
+        for i in range(6):
+            letter = sides[i+1]
+            face_bgrs = BGR_mean[i*9:(i+1)*9]
+            avg = tuple(int(sum(c[k] for c in face_bgrs)/9) for k in range(3))
+            face_colors[letter] = classify_bgr_to_6(avg)[1]
+
+        canvas_h = max(h, estimate_sidebar_height(['Click a face below to rescan it,', 'or Accept to continue.'],
+                                                    review_buttons, None, net_edge))
+        if canvas_h > h:
+            pad = np.full((canvas_h-h, frame.shape[1], 3), (60, 60, 60), dtype=np.uint8)
+            padded_frame = np.vstack([frame, pad])
+        else:
+            padded_frame = frame
+        sidebar_img, rects = render_sidebar(canvas_h, font, 'Scan complete',
+                                             ['Click a face below to rescan it,', 'or Accept to continue.'],
+                                             review_buttons, compute_face_progress(), None, None,
+                                             face_colors, clickable_net=True, net_edge=net_edge)
+        compose_and_show(padded_frame, sidebar_img, rects)
+
+        key, action = poll_action(150)
+        try:
+            window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+        except:
+            window_closed = False
+        if window_closed or key == 27 or action == 'quit':
+            return False
+        if key == 32 or action == 'accept':
+            return True
+        if action and action.startswith('rescan_'):
+            rescan_one_face(action[len('rescan_'):])
 
 
 
@@ -2092,12 +2957,35 @@ def cubeAF():
         quit_func()                     # script is closed
     
     frame, w, h = read_camera()         # video stream and frame dimensions
-    if fixWindPos:                      # case the fixWindPos variable is set true on __main__ 
-        cv2.namedWindow('cube')         # create the cube window
+    if fixWindPos:                      # case the fixWindPos variable is set true on __main__
+        # WINDOW_AUTOSIZE (cv2's default) locks the window to the frame's pixel size with no way for the
+        # user to resize it, which clips off-screen on smaller/scaled displays with no way to recover. WINDOW_NORMAL
+        # makes it a normal, user-resizable window instead.
+        cv2.namedWindow('cube', cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback('cube', on_cube_mouse)   # sidebar buttons become clickable
         cv2.moveWindow('cube', 0,0)     # move the cube window to (0,0)
-        cv2.imshow('cube', frame)       # shows the frame
-    
-    
+        try:                             # best-effort: cap the initial window size to the actual screen, so it
+            import ctypes                # doesn't open larger than the display with nothing yet telling the user
+            user32 = ctypes.windll.user32     # it's now draggable-resizable (Windows only; harmless no-op elsewhere)
+            screen_w, screen_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            # cv2's WINDOW_NORMAL stretches whatever's shown to fill the window rect exactly (no letterboxing),
+            # so this must match the ACTUAL composed canvas size show_cube_frame() will display - not the raw
+            # camera height - or the image gets non-uniformly squashed/stretched to fit a mismatched window.
+            # Sized for the normal scanning state (2 instruction lines, 2 buttons, no preview) rather than the
+            # minimal 'Starting...' screen, so the window doesn't need to immediately resize once scanning begins.
+            composed_h = max(h, estimate_sidebar_height(['line one', 'line two'], [('a', 'a', 'a'), ('b', 'b', 'b')], None))
+            init_h = min(composed_h, screen_h - 80)  # leaves room for the window's title bar and the taskbar
+            init_w = int((w+SIDEBAR_W) * init_h/composed_h)   # composed canvas is the camera view plus the sidebar
+            cv2.resizeWindow('cube', init_w, init_h)
+        except Exception:
+            pass
+        show_cube_frame(frame, h, 'Starting...', ['Getting the camera ready.'], [('quit', 'Close', 'danger')])
+        for _ in range(5):              # lets the window actually finish opening/painting on screen
+            cv2.waitKey(30)             # a freshly created window can briefly (mis)report itself as not-visible,
+                                         # which the window-closed checks below would otherwise mistake for the user having clicked X
+    window_open_time = time.time()      # window-closed checks are only trusted after this warm-up grace period
+
+
     if side==0:                         # side zero is used as starting phase, cube faces are numbered 1 to 6 
         faces.clear()                   # empties the dict of images (6 sides) recorded during previous solving cycle 
         show_time = 12                  # showing time of the unfolded cube images (its initial status)
@@ -2107,11 +2995,30 @@ def cubeAF():
         proceed = False                 # proceed variable is set False (variable to jump into facelet reading mode)
         
 
-    while quitting == False:            # substantially the main loop, it can be interrupted by quit_func() 
-        
-        key = cv2.waitKey(150)          # refresh time, aand time to check keyboard
+    def scan_state_text():
+        ''' Title/instructions for the sidebar, reflecting the current prepare-countdown/reading state.'''
+        wait_time = int(delay-(time.time()-det_face_time))+1
+        if wait_time > 0 and not proceed:
+            return (f'Prepare side {sides[side]} - {wait_time}s',
+                    ['Hold the cube face inside the frame.', 'Press SPACE to start early.'])
+        return (f'Reading side {sides[side]}',
+                ['Hold the cube face inside the frame.', 'Wait for the box to turn green.'])
+
+    # one constant button SET for the whole scan loop (accept/retry/quit) - which ones are enabled changes by
+    # state, but the set itself never does, so the sidebar layout (and window size) stays constant instead of
+    # buttons appearing/disappearing and the window resizing as the loop moves between states. Calibrate lives
+    # in its own separated top_button slot instead - a different kind of action from the scan flow below it.
+    def scan_buttons(accept_retry_enabled):
+        return [('accept', 'Accept', 'primary', accept_retry_enabled),
+                ('retry', 'Retry', 'secondary', accept_retry_enabled),
+                ('quit', 'Close', 'danger', True)]
+    calibrate_top_button = ('calibrate', 'Calibrate colors', 'secondary')
+
+    while quitting == False:            # substantially the main loop, it can be interrupted by quit_func()
+
+        key = poll_key(150)             # refresh time, and time to check keyboard/sidebar-button clicks
         try:
-            window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+            window_closed = time.time()-window_open_time > 0.5 and cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
         except:
             window_closed = False
         if window_closed:
@@ -2123,21 +3030,37 @@ def cubeAF():
         elif key == 27:                 # ESC button method to close CV2 windows
             quit_func()                 # quit function is called
             return cube_color_sequence, cube_status_string   # function is closed
-            
+        elif key in (ord('c'), ord('C')):  # enters interactive color calibration (6 colors, SPACE to sample each)
+            calibrate_cube_colors()
+            det_face_time = time.time()    # calibration paused the scan for a while: restart the capture delay
+
         frame, w, h = read_camera()     # video stream and frame dimensions
+
+        if key in (ord('s'), ord('S')):     # saves the raw camera frame to disk, for offline debugging
+            debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       f'debug_frame_{dt.datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+            cv2.imwrite(debug_path, frame)
+            print(f'\nSaved raw frame to {debug_path}')
+
         text_bg(frame, w, h)            # generates a rectangle as backgroung for text in Frame
 
         if side==0:                     # case side equals zero
             side = window_for_cube_rotation(w, h, side, frame) # keeps video stream while suggesting which cube's face to show
             
-        (contours, hierarchy)=read_facelets(det_face_time, delay, proceed)  # reads cube's facelets and returns the contours
+        if scan_mode == 'grid':          # case the fixed-grid scanning mode is selected
+            (contours, hierarchy)=read_facelets_fixed_grid(det_face_time, delay, proceed)  # grid-aligned synthetic contours
+        else:                            # case the auto-detect (contour) scanning mode is selected
+            (contours, hierarchy)=read_facelets(det_face_time, delay, proceed)  # reads cube's facelets and returns the contours
         
         candidates = []                        # empties the list of potential contours
-        if hierarchy is not None:              # analyze the contours in case these are previously retrieved
+        if hierarchy is None:                  # no candidate contours this frame (e.g. no cube face found yet):
+            title, instr = scan_state_text()
+            show_cube_frame(frame, h, title, instr, scan_buttons(False), current_letter=sides[side], top_button=calibrate_top_button)   # still refresh the window, otherwise it keeps showing a stale frame
+        else:                                   # analyze the contours in case these are previously retrieved
             hierarchy = hierarchy[0]           # only top level contours (no childs)
             facelets = []                      # empties the list of contours having cube's square characteristics
 
-            for component in zip(contours, hierarchy):  # each contour is analyzed   
+            for component in zip(contours, hierarchy):  # each contour is analyzed
 
                 if key == 27:                  # ESC button method to close CV2 windows
                     quit_func()                # quit function is called
@@ -2145,9 +3068,21 @@ def cubeAF():
 
                 contour, hierarchy, corners = get_approx_contours(component)   # contours are approximated
 
-                cv2.imshow('cube', frame)      # shows the frame 
-                key=cv2.waitKey(20)            # refresh time set to 20ms (real time is longher)
-                
+                title, instr = scan_state_text()
+                show_cube_frame(frame, h, title, instr, scan_buttons(False), current_letter=sides[side], top_button=calibrate_top_button)   # shows the frame
+                key=poll_key(20)               # refresh time set to 20ms (real time is longher)
+
+                # this loop can run many iterations per frame (one per candidate contour), so the window-closed
+                # (X button) check needs to happen here too, not just at the top of the outer loop, otherwise a
+                # click on X during a busy frame gets missed and the next imshow() call re-draws the window
+                try:
+                    window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
+                except:
+                    window_closed = False
+                if window_closed:
+                    quit_func()                # quit function is called
+                    return cube_color_sequence, cube_status_string  # function is closed
+
                 if time.time() < det_face_time + delay: # case the delay time is not elapsed yet
                     if key == 32:              # case spacebar is pressed
                         proceed = True         # proceed is set true (from preparing the cube to read facelets)
@@ -2167,23 +3102,26 @@ def cubeAF():
 
                 
                 # case having 9 contours with right characteristics              
-                if len(facelets)==9:     
+                if len(facelets)==9:
                     read_color(facelets, candidates, BGR_mean, H_mean)   # each facelet is read for color, decoration for the viewer is made
                     kociemba_facelets_BGR_mean = BGR_mean                # facelets are ordered as per kociemba order
-                    plot_colors(kociemba_facelets_BGR_mean, edge, frame, font, fontScale, lineType) # plot a cube decoration with detected colors                
                     faces = face_image(frame, facelets, side, faces)     # image of the cube side is taken for later reference
                     det_face_time=time.time()          # face detection time stored as reference for the next one
                     proceed = False                    # proceed is set false, fto force a delay on facelets detection at cube face changing
 
-                    # accept/reject gate: user reviews the just-captured face before it counts
+                    # accept/reject gate: user reviews the just-captured face before it counts. Each preview
+                    # cell is also clickable ('edit_0'..'edit_8'), cycling that one facelet through the 6
+                    # canonical colors in place, so a single misread doesn't force a full rescan of the face.
                     accepted = False
                     retry_face = False
+                    preview_face = [classify_bgr_to_6(bgr)[1] for bgr in BGR_mean[-9:]]
                     while not accepted and not retry_face:
-                        text_bg(frame, w, h)           # redraws the text background band
-                        cv2.putText(frame, f'Side {sides[side]} captured - SPACE: accept   R: retry   ESC: quit',
-                                    (10, 30), font, fontScale*1.2, fontColor, lineType)
-                        cv2.imshow('cube', frame)      # shows the frame, with the just-read colors already plotted on it
-                        key = cv2.waitKey(150)         # refresh time, and time to check keyboard
+                        show_cube_frame(frame, h, f'Side {sides[side]} captured',
+                                        ['Check the colors look right,', 'then accept or retry.'],
+                                        scan_buttons(True),
+                                        preview_face, current_letter=sides[side], top_button=calibrate_top_button,
+                                        editable_preview=True)
+                        key, action = poll_action(150)  # refresh time, and time to check keyboard/sidebar-button clicks
                         try:
                             window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
                         except:
@@ -2195,6 +3133,12 @@ def cubeAF():
                             accepted = True
                         elif key in (ord('r'), ord('R')):  # 'r' rejects this face, to retry it
                             retry_face = True
+                        elif action is not None and action.startswith('edit_'):
+                            idx = int(action[len('edit_'):])
+                            cur_name = classify_bgr_to_6(BGR_mean[-9+idx])[0]
+                            next_name = CYCLE_COLORS[(CYCLE_COLORS.index(cur_name)+1) % len(CYCLE_COLORS)]
+                            BGR_mean[-9+idx] = DEFAULT_REF_COLORS[next_name]   # exact reference BGR: classifies back to next_name unambiguously
+                            preview_face[idx] = DEFAULT_REF_COLORS[next_name]
 
                     if retry_face:                     # case the user asked to retry this face
                         del BGR_mean[-9:]               # this face's 9 facelets are removed from the running list
@@ -2202,11 +3146,11 @@ def cubeAF():
                         break                           # for loop is interrupted, to re-start facelet search for the same side
 
                     if on_face_captured is not None:   # case a callback has been provided (i.e. by the GUI)
-                        on_face_captured(side, BGR_mean[-9:])  # the just-accepted face's 9 BGR colors are handed over
+                        on_face_captured(side, preview_face)  # the just-accepted face's 9 classified colors
 
                     if side < 6:  # actions when a face has been completely detected, and there still are other to come
-                        cv2.imshow('cube', frame)      # frame is showed to viewer
-                        key=cv2.waitKey(20)            # delay for viewer to realize the face is aquired
+                        show_cube_frame(frame, h, f'Side {sides[side]} accepted', ['Get the next side ready.'], scan_buttons(False), top_button=calibrate_top_button)
+                        key=poll_key(20)               # delay for viewer to realize the face is aquired
                         if key == 27:                  # ESC button method to close CV2 windows
                             quit_func()                # quit function is called
                             return cube_color_sequence, cube_status_string   # function is closed
@@ -2215,8 +3159,21 @@ def cubeAF():
 
 
                     if side == 6:  # case last cube's face is acquired
-                        
-                        # cube string status with colors detected 
+
+                        if not review_scan():          # lets the user rescan any face before solving; False = quit
+                            quit_func()
+                            return cube_color_sequence, cube_status_string
+                        kociemba_facelets_BGR_mean = BGR_mean   # review may have replaced some faces' entries
+
+                        # BGR_mean/kociemba_facelets_BGR_mean was accumulated in SCAN order (whatever order
+                        # 'sides' presents the 6 faces in), but cube_colors_interpreted() assumes the fixed
+                        # kociemba position order U,R,F,D,L,B (it reads specific fixed indices directly, e.g.
+                        # facelet 4=U's center, 13=R's center, ...) - reorder into that fixed order so any
+                        # scan order works correctly, not just one that happens to already be U,R,F,D,L,B.
+                        scan_order_letters = [sides[i] for i in range(1, 7)]
+                        kociemba_facelets_BGR_mean = reorder_to_kociemba_position(kociemba_facelets_BGR_mean, scan_order_letters)
+
+                        # cube string status with colors detected
                         cube_status, HSV_detected, cube_color_sequence = cube_colors_interpreted(kociemba_facelets_BGR_mean)
                         
                         cube_status_string = cube_string(cube_status)  # cube string for the solver
@@ -2253,7 +3210,7 @@ def cubeAF():
 
                         if solution_Text == 'Error':   # still an error after HSV color analysis
                             show_time_ = show_time     # time to show on screen the decorative info (cube collage)
-                            deco_info = (fixWindPos, frame, faces, edge, cube_status, cube_color_sequence,\
+                            deco_info = (fixWindPos, frame, faces, deco_edge, cube_status, cube_color_sequence,\
                                          kociemba_facelets_BGR_mean, font, fontScale, lineType, show_time_,\
                                          timestamp, color_detection_winner)
                             
@@ -2266,7 +3223,7 @@ def cubeAF():
                         
                         elif solution_Text != 'Error':  # no errors BGR or HSV color analysis
                             show_time_ = 2              # time to show on screen the decorative info (cube collage)
-                            deco_info = (fixWindPos, frame, faces, edge, cube_status, cube_color_sequence,\
+                            deco_info = (fixWindPos, frame, faces, deco_edge, cube_status, cube_color_sequence,\
                                          kociemba_facelets_BGR_mean, font, fontScale, lineType, show_time_,\
                                          timestamp, color_detection_winner)
                             
@@ -2278,8 +3235,9 @@ def cubeAF():
                             return cube_color_sequence, cube_status_string         # main cube info are returned                                    
                  
                 # shows the frame
-                cv2.imshow('cube', frame)
-    
+                title, instr = scan_state_text()
+                show_cube_frame(frame, h, title, instr, scan_buttons(False), current_letter=sides[side], top_button=calibrate_top_button)
+
     return cube_color_sequence, cube_status_string
 
 
@@ -2289,7 +3247,7 @@ def cubeAF():
 
 
 def cube_status(cam_num, cam_width, cam_height, cam_crop_at_right, cam_facelets, c_debug, c_estimate_fclts, c_delay,
-                 c_on_face_captured=None):
+                 c_on_face_captured=None, c_scan_mode='auto'):
     ''' This function:
         starts up the CV part with related settings
         acquires the facelets status
@@ -2297,13 +3255,14 @@ def cube_status(cam_num, cam_width, cam_height, cam_crop_at_right, cam_facelets,
         returns the cube status if coherent
         shows the detected and interpreted colors if cube status not coherent.'''
 
-    global debug, estimate_fclts, fixWindPos, delay, on_face_captured
+    global debug, estimate_fclts, fixWindPos, delay, on_face_captured, scan_mode
 
     debug = c_debug                       # flag to enable/disable the debug related prints
     estimate_fclts = c_estimate_fclts     # flag to enable/disable the estimation on facelets position/contour
     delay = c_delay                       # delay for facelets detection at faces change
     fixWindPos = True                     # flag to fix the CV2 windows position, starting from coordinate 0,0,0
     on_face_captured = c_on_face_captured # optional callback(side, bgr9), called once a face is accepted by the user
+    scan_mode = c_scan_mode               # 'auto' (contour detection) or 'grid' (fixed on-screen grid)
     try:
         start_up(cam_num, cam_width, cam_height, cam_crop_at_right, cam_facelets) # starts Webcam and other settings
         ccs, cube_status_string = cubeAF()    # cube reading/solving function returning cube color sequence an cube status
