@@ -1102,7 +1102,7 @@ def send_cube_solving_string_to_robot():
     """Sends the current cube_solving_string to the robot over serial and starts it. Factored out of
     robot_solver() so resume_solve() can reuse the exact same send path without recursing back through
     robot_solver() (which dispatches on the button's current text - resume_solve() runs while it still reads
-    "Resume", not "Send\\ndata\\nto\\nrobot")."""
+    "Resume", not "Solve")."""
 
     global cube_solving_string, cube_solving_string_robot, ser
 
@@ -1155,7 +1155,7 @@ def robot_solver():
         reset_robot_and_gui()                 # robot and bring the GUI cube sketch back to a clean state
         # (not "Resume" - see the note in gui_robot_btn_update() on why that's not offered right now)
 
-    elif b_robot["text"] == "Send\ndata\nto\nrobot":        # case the button is ready to send solving string to the robot
+    elif b_robot["text"] == "Solve":        # case the button is ready to send solving string to the robot
         send_cube_solving_string_to_robot()
 
     elif b_robot["text"] == "STOP\nROBOT":                # case the button is in stop-robot mode
@@ -1291,7 +1291,7 @@ def gui_robot_btn_update():
 
         # case there serial communication is set, and there are robot moves on cube solving string
         elif serialData and "f)" in cube_solving_string and not "(0" in cube_solving_string:
-            b_robot["text"] = "Send\ndata\nto\nrobot"     # large robot button text, to feedback the status
+            b_robot["text"] = "Solve"                     # large robot button text, to feedback the status
             b_robot["relief"] = "raised"                  # large robot button is raised
             b_robot["state"] = "active"                   # large robot button is activated
             b_robot["bg"] = "OliveDrab1"                  # large robot button is green colored
