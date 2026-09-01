@@ -67,9 +67,7 @@ Very high level notes:<br />
 - If you use macOS or Ubuntu, update RubikTwoPhase solver to latest version (v1.1.1, released on 16th Nov. 2022).<br /><br />
 
 
-# How to present the cube to the webcam:
-Video tutorial explaining how to present the cube to the webcam: https://youtu.be/udr6tryxA_Y.<br />
-![title image](/images/title2_pic.png)
+
 
 
 
