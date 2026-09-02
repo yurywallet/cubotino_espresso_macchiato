@@ -35,7 +35,9 @@ import json
 import os
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cube_color_calibration.json')
-calibrated_colors = {}   # {'white': (B,G,R), ...}, filled by load_color_calibration()/calibrate_cube_colors()
+calibrated_colors = {}   # {'white': [(B,G,R), ...], ...} - a list of real sample points per color (one per
+                          # facelet sampled during calibration), filled by load_color_calibration()/
+                          # calibrate_cube_colors()
 
 # fallback reference palette (BGR), used for live display classification when no calibration has been done yet
 DEFAULT_REF_COLORS = {'white':(255,255,255), 'red':(0,0,204), 'green':(0,132,0),
@@ -47,10 +49,25 @@ CYCLE_COLORS = ['white', 'green', 'yellow', 'orange', 'red', 'blue']   # order a
 STD_LETTER_COLOR = {'U':'white', 'R':'red', 'F':'green', 'D':'yellow', 'L':'orange', 'B':'blue'}
 NET_LAYOUT = {'U':(1,0), 'L':(0,1), 'F':(1,1), 'R':(2,1), 'B':(3,1), 'D':(1,2)}
 
+# for the face currently being scanned, which color sits on each of its 4 physical neighbors (top/bottom/left/
+# right as the face is presented square-on to the camera) - derived from NET_LAYOUT's own cross-shaped net
+# (U above F, D below F, L-F-R-B in a row) by standard net-folding: folding along a shared edge preserves the
+# left/right (for a horizontal fold, U/D) or top/bottom (for a vertical fold, the L-F-R-B belt) sense across
+# it, and each face's far/unfolded edge wraps around to its opposite-of-the-fold neighbor. Cross-checked
+# against a worked example (U: top=blue, bottom=green, left=orange, right=red).
+ADJACENT_BORDER = {
+    'F': {'top':'white', 'bottom':'yellow', 'left':'orange', 'right':'red'},
+    'U': {'top':'blue',  'bottom':'green',  'left':'orange', 'right':'red'},
+    'D': {'top':'green', 'bottom':'blue',   'left':'orange', 'right':'red'},
+    'L': {'top':'white', 'bottom':'yellow', 'left':'blue',   'right':'green'},
+    'R': {'top':'white', 'bottom':'yellow', 'left':'green',  'right':'blue'},
+    'B': {'top':'white', 'bottom':'yellow', 'left':'red',    'right':'orange'},
+}
+
 
 try:
     import sys, platform
-    print('\n===================  webcam module AF (17 January 2023)  ===========================')
+    print('\n===============  webcam module - CUBOTino espresso macchiato  ======================')
     print(f'Running on: {platform.system()}')         # print to terminal, the platform used
     print(f'Python version: {sys.version}')           # print to termina the python version
     print(f'CV2 version: {cv2.__version__}')          # print to terminal the cv2 version
@@ -627,15 +644,59 @@ def synthetic_facelets_from_rects(rects, inset=6):
     return contours, hierarchy
 
 
-def detect_in_fixed_zone(frame, w, h):
+class Debouncer:
+    ''' Smooths a noisy frame-by-frame boolean signal: the reported (stable) value only changes once the raw
+    input has agreed with the new value for `frames` consecutive readings, instead of flipping the instant a
+    single frame disagrees. Re-evaluating "is the cube in position" from scratch on every single frame, with
+    no memory of the previous one, means a tiny hand tremor that makes just one facelet momentarily fail its
+    contour check flips the result immediately - which is what made the calibration "Sample" button flicker
+    on/off on every small movement, independent of camera framerate (a slower framerate doesn't smooth this
+    out, it just makes each wrong flicker READING stay on screen longer before the next frame corrects it).'''
+
+    def __init__(self, frames=5, initial=False):
+        self.frames = frames     # how many consecutive agreeing readings before the stable value moves
+        self.stable = initial
+        self._pending = initial
+        self._count = 0
+
+    def update(self, raw_value):
+        ''' Feed the latest raw (single-frame) reading; returns the current debounced/stable value.'''
+        if raw_value == self._pending:
+            self._count += 1
+        else:
+            self._pending = raw_value
+            self._count = 1
+        if self._count >= self.frames:
+            self.stable = self._pending
+        return self.stable
+
+
+_default_zone_debounce = Debouncer(frames=5)   # used whenever a caller doesn't bring its own (see below) - a
+                                                # single persistent instance works fine shared across the whole
+                                                # module without ever needing an explicit reset: moving to a new
+                                                # face/color means physically pulling the cube out of the zone
+                                                # for a moment first, which already drives enough consecutive
+                                                # "not found" frames to naturally re-settle it to False before
+                                                # the next steady-hold sequence begins.
+
+
+def detect_in_fixed_zone(frame, w, h, debounce=None):
     ''' Draws a fixed target zone in the frame for the user to hold a cube face against, and looks for the 9
     facelet squares (see find_cube_facelet_squares()) ONLY within that zone - restricting both detection and
     color sampling to a small, known region, rather than hunting the whole frame where background clutter can
-    get mistaken for the cube. The zone's border is white by default and turns GREEN as soon as a full 3x3 grid
-    is confirmed inside it, giving direct visual feedback that the cube is positioned correctly. Used by both
-    the normal scan (read_facelets()) and color calibration (calibrate_cube_colors()).
+    get mistaken for the cube. The zone's border is white by default and turns GREEN once a full 3x3 grid has
+    been confirmed inside it for several consecutive frames (see Debouncer) - giving stable visual feedback
+    that the cube is positioned correctly, instead of the border (and calibration's "Sample" button, which
+    shares this same signal) flickering on/off with every tiny hand tremor. Used by both the normal scan
+    (read_facelets()) and color calibration (calibrate_cube_colors()).
+    debounce: pass a Debouncer instance to use (and update) for this decision - e.g. so a caller can read the
+    exact same stable value afterwards (calibrate_cube_colors() does, for its Sample button's enabled state).
+    Omit it to use a shared module-level default, which every caller that doesn't need to inspect the debounced
+    value itself (i.e. read_facelets()) can just rely on with no extra wiring.
     background_h/offset keep the zone off the top/bottom text bands and the legend/sketch area.
-    Returns the 9 (x, y, w, h) facelet rects in full-frame coordinates (or [] if not confirmed).'''
+    Returns the 9 (x, y, w, h) facelet rects in full-frame coordinates (or [] if not confirmed) - this raw,
+    un-debounced value is what capture timing/color-reading logic uses; only the drawn border color (and
+    whatever the caller separately does with the passed-in debounce's .stable) is smoothed.'''
 
     zone_edge = max(20, int(width/facelets_in_width))
     zone_w = zone_edge*3
@@ -655,7 +716,10 @@ def detect_in_fixed_zone(frame, w, h):
     rects = find_cube_facelet_squares(zone, 0, 0)                    # search the (larger) area around the guide box
     rects = [(x+sx0, y+sy0, rw, rh) for (x, y, rw, rh) in rects]      # back to full-frame coordinates
 
-    zone_color = (0, 255, 0) if rects else (255, 255, 255)   # green once the cube is confirmed inside the zone
+    active_debounce = debounce if debounce is not None else _default_zone_debounce
+    stable_found = active_debounce.update(bool(rects))
+
+    zone_color = (0, 255, 0) if stable_found else (255, 255, 255)   # green once confirmed (and held) in the zone
     cv2.rectangle(frame, (zx0, zy0), (zx0+zone_w, zy0+zone_w), zone_color, 3)
     for (x, y, rw, rh) in rects:
         cv2.rectangle(frame, (x, y), (x+rw, y+rh), (255, 0, 0), 1)   # each detected facelet, thin blue square
@@ -663,11 +727,55 @@ def detect_in_fixed_zone(frame, w, h):
     return rects
 
 
+_color_buffer = []            # rolling buffer of the last few STABLE frames' 9 ordered facelet colors
+_captured_median_colors = None   # set by read_facelets() once the buffer is full; consumed once by read_color()
+COLOR_BUFFER_FRAMES = 3       # how many independent stable frames get combined before a capture is accepted
+
+
+def _buffer_and_median_colors(rects):
+    ''' Samples this frame's 9 facelet colors from `rects` (each with its own real detected size, so sampling
+    stays inside the actual sticker - see robust_facelet_color()), orders them into the same 0-8 grid position
+    order read_color() will finally see them in (via order_9points() - the exact same function/logic cubeAF()
+    itself applies to the real facelets before calling read_color(), so a buffered sample's position i is
+    guaranteed to mean the same grid cell every time this runs), and pushes them into a rolling buffer capped
+    at COLOR_BUFFER_FRAMES frames.
+
+    Combining several independent frames' readings (median, per facelet position) catches noise that a single
+    frame's own internal 5-patch median can't: sensor noise, slight motion blur in one specific frame, or a
+    webcam's auto-exposure/auto-white-balance quietly re-adjusting between frames even while the cube itself
+    is held still. It's the same "don't trust one sample" idea as robust_facelet_color(), just applied across
+    time instead of across one frame's own patches.
+
+    Returns the per-position median BGR list once the buffer has enough frames, else None (keep waiting).'''
+
+    global _color_buffer
+    ordered = order_9points(
+        [{'cx': x+rw//2, 'cy': y+rh//2,
+          'bgr': robust_facelet_color(frame, x+rw//2, y+rh//2, size=min(rw, rh))}
+         for (x, y, rw, rh) in rects],
+        [])
+    _color_buffer.append([pt['bgr'] for pt in ordered])
+    if len(_color_buffer) > COLOR_BUFFER_FRAMES:
+        _color_buffer.pop(0)
+    if len(_color_buffer) < COLOR_BUFFER_FRAMES:
+        return None
+
+    medians = []
+    for i in range(9):
+        channel_medians = []
+        for ch in range(3):
+            channel_medians.append(int(statistics.median(f[i][ch] for f in _color_buffer)))
+        medians.append(tuple(channel_medians))
+    return medians
+
+
 def read_facelets(det_face_time, delay, proceed):
     ''' Shows the fixed target zone (see detect_in_fixed_zone()) and reads the 9 facelets once the cube is
     confirmed inside it (zone border turns green) and the capture delay/spacebar gate has passed.
     The camera view itself stays clean (no text drawn on it) - status/instructions live in the sidebar,
     composed by the caller (cubeAF()) via render_sidebar()/compose_and_show().'''
+
+    global _color_buffer, _captured_median_colors
 
     wait_time = int(delay-(time.time() - det_face_time)) + 1
 
@@ -683,9 +791,20 @@ def read_facelets(det_face_time, delay, proceed):
         min_area = avg_area*0.4
         max_area = avg_area*2.0
 
-    if (wait_time > 0 and not proceed) or not rects:
+    # only buffer color samples once the cube is CONFIRMED stable (detect_in_fixed_zone()'s own debounce, via
+    # the shared default it uses here since no explicit one is passed) - buffering starts fresh every time
+    # stability is lost, so a frame from before/after a steady hold can never get averaged in with clean ones.
+    if not rects or not _default_zone_debounce.stable:
+        _color_buffer.clear()
         return [], None       # not yet time to capture, or the cube isn't confirmed in the zone: nothing to hand downstream
 
+    medians = _buffer_and_median_colors(rects)
+
+    if (wait_time > 0 and not proceed) or medians is None:
+        return [], None       # still waiting on the capture-delay timer, or haven't buffered enough stable
+                               # frames yet - either way, nothing to hand downstream this frame
+
+    _captured_median_colors = medians   # picked up by read_color() instead of it re-sampling from this one frame
     return synthetic_facelets_from_rects(rects)
 
 
@@ -1208,29 +1327,31 @@ def cube_colors_interpreted(BGR_detected):
         print(f'\nBGR_detected: {BGR_detected}')   # feedback is printed to the terminal
         print(f'\nHSV: {HSV_detected}')            # feedback is printed to the terminal
 
-    # Step2: initial reference colors. A saved calibration (see calibrate_cube_colors(), measured directly
-    # off the user's own cube under their own lighting) is preferred when available, since it's far more
-    # reliable than trusting whichever 6 center facelets this particular scan happened to detect.
+    # Step2: initial reference POINTS per color (a list, not a single point). A saved calibration (see
+    # calibrate_cube_colors(), measured directly off the user's own cube under their own lighting) is
+    # preferred when available - it now provides several real sample points per color (one per facelet of the
+    # 3x3 calibration zone) rather than one, so a single unlucky/skewed sample can't single-handedly mis-
+    # anchor a color the way one point always could.
     if len(calibrated_colors) == 6:
-        cube_ref_colors = dict(calibrated_colors)
+        cube_ref_colors = {color: list(points) for color, points in calibrated_colors.items()}
     else:
-        cube_ref_colors = {'white':BGR_detected[4], 'red':BGR_detected[13], 'green':BGR_detected[22],
-                           'yellow':BGR_detected[31], 'orange':BGR_detected[40], 'blue':BGR_detected[49]}
+        cube_ref_colors = {'white':[BGR_detected[4]], 'red':[BGR_detected[13]], 'green':[BGR_detected[22]],
+                           'yellow':[BGR_detected[31]], 'orange':[BGR_detected[40]], 'blue':[BGR_detected[49]]}
 
     # Step3: dictionary with the color distances from the (initial) references
     color_distance={}                                             # empty dict to store all the color distances for all the facelets
-    cube_ref_colors_lab={}                                        # empty dictionary to store color refences in Lab color space
-    for color, BGR in cube_ref_colors.items():
-        B,G,R = BGR                                               # BGR values are unpact from the dict
-        cube_ref_colors_lab[color]=tuple(rgb2lab([R,G,B]))        # BGR conversion to lab color space and dict feeding
-            
-    for facelet, color_measured in BGR_detected_dict.items():         
+    cube_ref_colors_lab={}                                        # empty dictionary to store color refences in Lab color space (lists of points)
+    for color, points in cube_ref_colors.items():
+        cube_ref_colors_lab[color]=[tuple(rgb2lab([r,g,b])) for (b,g,r) in points]
+
+    for facelet, color_measured in BGR_detected_dict.items():
         B,G,R = color_measured
         lab_meas = rgb2lab([R,G,B])                               # conversion to lab color space (due CIEDE2000 function)
         distance=[]                                               # list with the distance from the 6 references, for each facelet
-        for color, lab_ref in cube_ref_colors_lab.items():        # iteration over the 6 reference colors
-            distance.append(CIEDE2000(tuple(lab_meas), lab_ref))  # Euclidean distance toward the 6 reference colors
-        color_distance[facelet]=distance                          
+        for color, lab_refs in cube_ref_colors_lab.items():       # iteration over the 6 reference colors
+            # nearest of that color's reference points, not a single fixed one
+            distance.append(min(CIEDE2000(tuple(lab_meas), lab_ref) for lab_ref in lab_refs))
+        color_distance[facelet]=distance
     
     
     # Step4: Ordering the color distance (the min value per each facelet) by increasing values
@@ -1263,20 +1384,19 @@ def cube_colors_interpreted(BGR_detected):
     for value in BGR_ordered.values():            # iteration on the facelet's BGR values ordered by increasing color distance from ref
         B,G,R =value
         lab_meas = rgb2lab([R,G,B])                                         # conversion to lab color space (due CIEDE2000 function)
-        for color, lab_ref in cube_ref_colors_lab.items():                  # iteration over the 6 reference colors
-            distance[color]=CIEDE2000(tuple(lab_meas), lab_ref)             # Euclidean distance toward the 6 reference colors
+        for color, lab_refs in cube_ref_colors_lab.items():                 # iteration over the 6 reference colors
+            distance[color]=min(CIEDE2000(tuple(lab_meas), lab_ref) for lab_ref in lab_refs)  # nearest ref point
         color = min(distance, key=distance.get)                             # chosem color is the one with min distance from reference
-  
-        cube_status_by_color_distance[i]=color                              # dict of cube status wih the interpreted colors  
-#         distance_value.append(distance[min(distance, key=distance.get)])  # list with the color distance of the chosen facelet's color
-        distance.clear()                                                    # distance dict is cleared for the next facelet
-        
-        B_avg = math.sqrt((B**2+ (cube_ref_colors[color][0])**2)/2)   # average Red color id made from the chosen color and previous reference
-        G_avg = math.sqrt((G**2+ (cube_ref_colors[color][1])**2)/2)   # average Green color id made from the chosen color and previous reference
-        R_avg = math.sqrt((R**2+ (cube_ref_colors[color][2])**2)/2)   # average Blue color id made from the chosen color and previous reference
 
-        cube_ref_colors[color]=(B_avg, G_avg, R_avg)                    # Color reference dict is updated with the new BGR averaged color
-        cube_ref_colors_lab[color]=tuple(rgb2lab([R_avg,G_avg,B_avg]))  # Lab color space reference dict is updated with the new color reference 
+        cube_status_by_color_distance[i]=color                              # dict of cube status wih the interpreted colors
+        distance.clear()                                                    # distance dict is cleared for the next facelet
+
+        # this color's reference set grows with the real point just classified, instead of collapsing into one
+        # blended running average - later facelets are then matched against actual observed colors from this
+        # specific cube/lighting, which is more of what they'll actually look like than an increasingly-
+        # smoothed synthetic blend would be.
+        cube_ref_colors[color].append((B, G, R))
+        cube_ref_colors_lab[color].append(tuple(rgb2lab([R, G, B])))
         i+=1
     
     
@@ -1961,20 +2081,26 @@ def text_font():
 SIDEBAR_W = 320
 TOP_BTN_H = 34                   # slightly shorter than the main 42px action buttons - a visibly distinct,
                                   # secondary-feeling slot for a standalone setup action like "Calibrate colors"
-SIDEBAR_BG = (247, 247, 245)     # BGR, light neutral background
-TEXT_PRIMARY = (35, 35, 35)
-TEXT_SECONDARY = (110, 110, 110)
-ACCENT = (200, 120, 30)          # BGR blue accent, for the primary button
-ACCENT_ACTIVE = (175, 100, 15)   # darker, for hover/press feedback
-DANGER = (60, 60, 210)           # BGR red, for quit
-DANGER_ACTIVE = (45, 45, 180)
-BTN_SECONDARY_BG = (222, 222, 222)
-BTN_SECONDARY_ACTIVE = (200, 200, 200)
-DIVIDER = (216, 216, 214)
+# palette (BGR, since these paint straight into cv2 frames), derived from Cubotino_theme.py - the single
+# source of truth shared with Cubotino_GUI.py's UI_* theme, so both windows read as one app and can't drift
+# out of sync the way two hand-maintained copies eventually will.
+import Cubotino_theme as theme
+SIDEBAR_BG = theme.hex_to_bgr(theme.BG)
+TEXT_PRIMARY = theme.hex_to_bgr(theme.TEXT_PRIMARY)
+TEXT_SECONDARY = theme.hex_to_bgr(theme.TEXT_SECONDARY)
+ACCENT = theme.hex_to_bgr(theme.ACCENT)                # indigo, for the primary button
+ACCENT_ACTIVE = theme.hex_to_bgr(theme.ACCENT_ACTIVE)  # darker indigo, for hover/press feedback
+DANGER = theme.hex_to_bgr(theme.DANGER)                # red, for quit
+DANGER_ACTIVE = theme.hex_to_bgr(theme.DANGER_ACTIVE)
+BTN_SECONDARY_BG = theme.hex_to_bgr(theme.BTN_SECONDARY_BG)
+BTN_SECONDARY_ACTIVE = theme.hex_to_bgr(theme.BTN_SECONDARY_ACTIVE)
+DIVIDER = theme.hex_to_bgr(theme.DIVIDER)
+BTN_RADIUS = theme.BTN_RADIUS    # corner radius for the flat, rounded-rect modern button look
 INSTRUCTION_BLOCK_H = 104   # fixed height reserved for the instructions block: 2 items x up to 2 wrapped lines
                             # each (2*22) + the 8px per-item gap, regardless of how much a given state's text
                             # actually needs - keeps the sidebar layout (and window size) identical across
                             # states even when their instruction text wraps to different line counts
+PREVIEW_BORDER_T = 5        # thickness of the "Captured colors" grid's adjacent-face-color border strip
 
 current_button_rects = {}   # {'accept': (x1,y1,x2,y2), ...} in FULL composed-canvas coordinates
 mouse_clicked_action = None  # set by on_cube_mouse(), consumed (and cleared) once per main-loop iteration
@@ -2022,8 +2148,36 @@ def on_cube_mouse(event, x, y, flags, param):
         _set_windows_hand_cursor(hover_action is not None)
 
 
-DISABLED_BTN_BG = (235, 235, 235)   # BGR, near-invisible against the sidebar background
-DISABLED_BTN_FG = (190, 190, 190)
+DISABLED_BTN_BG = theme.hex_to_bgr(theme.DISABLED_BG)   # near-invisible against the sidebar background
+DISABLED_BTN_FG = theme.hex_to_bgr(theme.DISABLED_FG)
+
+
+def rounded_rect(img, pt1, pt2, color, thickness=-1, radius=BTN_RADIUS):
+    ''' Draws a rounded-corner rectangle - cv2 has no native primitive for this, so it's built from 4 corner
+    arcs plus the straight edges/fill between them. thickness=-1 fills it (same convention as cv2.rectangle);
+    a positive thickness draws just the outline. Used for the sidebar's buttons and preview cells, for a
+    flatter/more modern look than a hard-cornered rectangle - purely cosmetic, doesn't affect the (still
+    rectangular) click-detection rects those elements are hit-tested against.'''
+
+    x1, y1, x2, y2 = pt1[0], pt1[1], pt2[0], pt2[1]
+    r = max(0, min(radius, (x2-x1)//2, (y2-y1)//2))
+    if r == 0:
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        return
+    if thickness < 0:
+        cv2.rectangle(img, (x1+r, y1), (x2-r, y2), color, -1)
+        cv2.rectangle(img, (x1, y1+r), (x2, y2-r), color, -1)
+        for cx, cy in ((x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)):
+            cv2.circle(img, (cx, cy), r, color, -1)
+    else:
+        cv2.ellipse(img, (x1+r, y1+r), (r, r), 180, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x2-r, y1+r), (r, r), 270, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x1+r, y2-r), (r, r), 90, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x2-r, y2-r), (r, r), 0, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1+r, y1), (x2-r, y1), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1+r, y2), (x2-r, y2), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1, y1+r), (x1, y2-r), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x2, y1+r), (x2, y2-r), color, thickness, cv2.LINE_AA)
 
 
 def draw_button(img, rect, label, style, font, hovered=False, enabled=True):
@@ -2044,8 +2198,12 @@ def draw_button(img, rect, label, style, font, hovered=False, enabled=True):
     else:
         bg = ACCENT if style == 'primary' else (DANGER if style == 'danger' else BTN_SECONDARY_BG)
         fg = (255, 255, 255) if style in ('primary', 'danger') else TEXT_PRIMARY
-    cv2.rectangle(img, (x1, y1), (x2, y2), bg, -1)
-    cv2.rectangle(img, (x1, y1), (x2, y2), (200, 200, 200), 1, cv2.LINE_AA)
+    rounded_rect(img, (x1, y1), (x2, y2), bg, -1)
+    # a flat colored fill alone reads as a button for the accent/danger styles (strong contrast against the
+    # near-white sidebar), but the neutral secondary fill is close enough to the sidebar background to need a
+    # thin outline for definition - primary/danger skip it for a cleaner flat look.
+    if style == 'secondary':
+        rounded_rect(img, (x1, y1), (x2, y2), (222, 217, 214), 1)
     (tw, th), _ = cv2.getTextSize(label, font, 0.62, 1)
     cv2.putText(img, label, (x1+(x2-x1-tw)//2, y1+(y2-y1+th)//2), font, 0.62, fg, 1, cv2.LINE_AA)
 
@@ -2175,19 +2333,33 @@ def render_sidebar(height, font, title, instructions, buttons, face_progress, pr
     cv2.putText(img, label, (20, y), font, 0.5, TEXT_SECONDARY, 1, cv2.LINE_AA)
     y += 12
     cell = 30
+    # a border strip around the whole 3x3 block shows, on each side, which color belongs on that physical
+    # neighbor face - a compass for how the currently-framed face sits relative to the rest of the cube (see
+    # ADJACENT_BORDER). PREVIEW_BORDER_T must match estimate_sidebar_height()'s matching term.
+    border_t = PREVIEW_BORDER_T
+    grid_x0, grid_y0 = 20+border_t, y+border_t
+    neighbors = ADJACENT_BORDER.get(current_letter)
+    if neighbors is not None:
+        gx1, gy1 = grid_x0+3*cell-2, grid_y0+3*cell-2
+        def nb_bgr(side):
+            return DEFAULT_REF_COLORS[neighbors[side]]
+        cv2.rectangle(img, (grid_x0-border_t, grid_y0-border_t), (gx1+border_t, grid_y0), nb_bgr('top'), -1)
+        cv2.rectangle(img, (grid_x0-border_t, gy1), (gx1+border_t, gy1+border_t), nb_bgr('bottom'), -1)
+        cv2.rectangle(img, (grid_x0-border_t, grid_y0-border_t), (grid_x0, gy1+border_t), nb_bgr('left'), -1)
+        cv2.rectangle(img, (gx1, grid_y0-border_t), (gx1+border_t, gy1+border_t), nb_bgr('right'), -1)
     for row in range(3):
         for col in range(3):
             idx = row*3+col
-            cx, cy = 20+col*cell, y+row*cell
+            cx, cy = grid_x0+col*cell, grid_y0+row*cell
             col_bgr = preview_face[idx] if preview_face is not None else SIDEBAR_BG
             action = f'edit_{idx}'
             hovered = editable_preview and preview_face is not None and hover_action == action
-            cv2.rectangle(img, (cx, cy), (cx+cell-2, cy+cell-2), col_bgr, -1)
+            rounded_rect(img, (cx, cy), (cx+cell-2, cy+cell-2), col_bgr, -1, radius=4)
             border_color = (90, 90, 90) if hovered else (170, 170, 170)
-            cv2.rectangle(img, (cx, cy), (cx+cell-2, cy+cell-2), border_color, 2 if hovered else 1, cv2.LINE_AA)
+            rounded_rect(img, (cx, cy), (cx+cell-2, cy+cell-2), border_color, 2 if hovered else 1, radius=4)
             if editable_preview and preview_face is not None:
                 rects[action] = (cx, cy, cx+cell-2, cy+cell-2)
-    y += 3*cell+14
+    y += 2*border_t+3*cell+14
 
     y += 2
     cv2.putText(img, 'Face map', (20, y), font, 0.55, TEXT_SECONDARY, 1, cv2.LINE_AA)
@@ -2261,7 +2433,7 @@ def estimate_sidebar_height(instructions, buttons, preview_face, net_edge=40, to
     if top_button is not None:
         y += TOP_BTN_H+10+20                          # top button + its own divider
     y += INSTRUCTION_BLOCK_H                          # instructions: fixed block, regardless of actual wrap count
-    y += 6+12+3*30+14                                # "Captured colors" label + 3x3 grid (cell=30), always reserved
+    y += 6+12+2*PREVIEW_BORDER_T+3*30+14             # "Captured colors" label + border strip + 3x3 grid (cell=30)
     y += 2+12                                        # "Face map" label
     y += 3*net_edge+14                                # net + margin
     y += 8 + len(buttons)*42 + max(0, len(buttons)-1)*12  # buttons block + its own bottom margin
@@ -2368,18 +2540,32 @@ def average_color(image, x, y):
     return (int(math.sqrt(blue/num)), int(math.sqrt(green/num)), int(math.sqrt(red/num)))
 
 
-def robust_facelet_color(image, x, y):
+def robust_facelet_color(image, x, y, size=None):
     ''' Samples a facelet's color from 5 small patches (dead-center plus the 4 diagonal quadrants, all safely
     within the facelet) instead of only dead-center, and returns their per-channel median.
     A cube's center pieces very often carry a small manufacturer logo printed right in the middle of the
     sticker; sampling only dead-center risks averaging in that logo's ink instead of the sticker's actual
     color (this is what made a solved white face's center read as blue). The median of several patches shrugs
     off any one patch being corrupted by a logo, glare, or scratch, without needing to special-case which
-    facelets are centers.'''
+    facelets are centers.
+    size: this facelet's own actual side length in pixels, when the caller has it (from the contour/rect this
+    specific facelet was just detected as). Strongly preferred over the default: without it, patch placement
+    falls back to the module-wide `edge` estimate, which is set once for decoration/typical-scan purposes and
+    isn't necessarily this particular facelet's real size - if a cube's actual stickers are smaller than that
+    estimate (or its plastic body/border between stickers is a different color, e.g. some brands' black or
+    purple bezels), the off-center patches can land partly on the surrounding plastic instead of the sticker,
+    quietly biasing the "sticker" color toward whatever the plastic between stickers looks like.'''
 
     global edge
-    patch = max(4, edge//2)          # small sampling half-size per patch, so an off-center patch mostly clears a centered logo
-    off = edge                       # how far off-center the 4 diagonal patches sit
+    if size:      # this facelet's own real size is known: inset patches safely within it, rather than using
+                  # the module-wide `edge` estimate (unchanged fallback below, for callers that don't have it)
+        half = max(4, int(size)//2)
+        patch = max(3, half//3)       # smaller than the fallback's patches, since off is also pulled in more
+        off = int(half*0.6)           # inset from the facelet's own edge, so a patch can't clip the border/
+                                       # gap/plastic around the sticker even if `size` is only approximate
+    else:
+        patch = max(4, edge//2)       # unchanged: today's existing behavior, for any caller not yet passing size
+        off = edge
     offsets = [(0, 0), (-off, -off), (off, -off), (-off, off), (off, off)]
 
     samples = []
@@ -2406,7 +2592,15 @@ def load_color_calibration():
         try:
             with open(CALIBRATION_FILE, 'r') as f:
                 data = json.load(f)
-            calibrated_colors = {color: tuple(bgr) for color, bgr in data.items()}
+            # each color's value is a list of [B,G,R] points (one per facelet sampled - see
+            # calibrate_cube_colors()); a file saved by an older version of this code (a single [B,G,R] per
+            # color, not a list of them) is upgraded transparently by wrapping it in a list, rather than
+            # discarding a perfectly usable existing calibration.
+            calibrated_colors = {}
+            for color, points in data.items():
+                if points and isinstance(points[0], (int, float)):
+                    points = [points]
+                calibrated_colors[color] = [tuple(p) for p in points]
             print(f'\nLoaded color calibration from {CALIBRATION_FILE}: {calibrated_colors}')
         except Exception as ex:
             print(f'\nCould not load color calibration ({ex}), starting uncalibrated')
@@ -2418,7 +2612,7 @@ def save_color_calibration():
 
     try:
         with open(CALIBRATION_FILE, 'w') as f:
-            json.dump({color: list(bgr) for color, bgr in calibrated_colors.items()}, f)
+            json.dump({color: [list(p) for p in points] for color, points in calibrated_colors.items()}, f)
         print(f'\nSaved color calibration to {CALIBRATION_FILE}')
     except Exception as ex:
         print(f'\nCould not save color calibration: {ex}')
@@ -2428,19 +2622,21 @@ def classify_bgr_to_6(bgr):
     ''' Classifies a raw captured BGR color into the nearest of the 6 known cube colors (white, red, green,
     yellow, orange, blue), via CIEDE2000 distance in Lab space against calibrated_colors if available, else
     the DEFAULT_REF_COLORS fallback palette. Returns (color_name, display_bgr).
+    Each color is matched against several real reference points when calibrated_colors is available (one per
+    facelet sampled during calibration - see calibrate_cube_colors()), not just one: the nearest point of any
+    color wins, rather than distance to one single (and possibly unlucky/skewed) point per color.
     display_bgr is always DEFAULT_REF_COLORS[color_name] - a clean, bright, fixed BGR - regardless of which
     reference set decided the match: calibrated_colors is only ever used to decide WHICH of the 6 names is
     closest, never as the color painted on screen. A bad/dim calibration sample would otherwise get painted
     back verbatim on every facelet classified to that color, looking like none of the 6 predefined colors at
     all - exactly what showed up when an early, logo-skewed calibration was in use.'''
 
-    ref = calibrated_colors if len(calibrated_colors) == 6 else DEFAULT_REF_COLORS
+    ref = calibrated_colors if len(calibrated_colors) == 6 else {c: [v] for c, v in DEFAULT_REF_COLORS.items()}
     B, G, R = bgr
     lab_meas = rgb2lab([R, G, B])
     best_color, best_dist = None, None
-    for color, (rb, rg, rr) in ref.items():
-        lab_ref = rgb2lab([rr, rg, rb])
-        dist = CIEDE2000(tuple(lab_meas), tuple(lab_ref))
+    for color, points in ref.items():
+        dist = min(CIEDE2000(tuple(lab_meas), tuple(rgb2lab([rr, rg, rb]))) for (rb, rg, rr) in points)
         if best_dist is None or dist < best_dist:
             best_dist = dist
             best_color = color
@@ -2459,13 +2655,29 @@ def calibrate_cube_colors():
 
     for step, color_name in enumerate(colors_to_calibrate):
         sampled = False
+        ready_debounce = Debouncer(frames=5)   # ~5 consecutive frames of agreement before the Sample button's
+                                                # ready state actually flips - see Debouncer's own docstring
         while not sampled:
             frame, w, h = read_camera()
-            rects = detect_in_fixed_zone(frame, w, h)
-            ready = len(rects) == 9
+            # ready_debounce is passed in (rather than left to detect_in_fixed_zone()'s own shared default) so
+            # the Sample button's enabled state below reads the exact same debounced signal the zone border
+            # itself was just drawn with - two separately-debounced signals could disagree for a frame or two
+            # (e.g. border already green while the button hasn't caught up yet), which would be its own small
+            # source of confusion.
+            rects = detect_in_fixed_zone(frame, w, h, debounce=ready_debounce)
+            ready = ready_debounce.stable
             hint = 'Zone is green - press SAMPLE.' if ready else 'Fill the frame with that color until the box turns green.'
+            # button count and top_button presence must match the main scan screens' (scan_buttons(): 3
+            # buttons, plus a top_button) - estimate_sidebar_height() sizes the window from exactly those two
+            # things, not from what the buttons actually do, so a mismatch here made the window visibly
+            # resize every time calibration opened/closed instead of staying one constant size throughout.
+            # The 3rd button and the top_button are real widgets but disabled/inert - only their reserved
+            # space matters, same "disabled but still takes up its space" pattern used everywhere else here.
             show_cube_frame(frame, h, f'Calibrate ({step+1}/6): {color_name.upper()}', [hint],
-                             [('sample', 'Sample', 'primary' if ready else 'secondary'), ('cancel', 'Cancel', 'danger')])
+                             [('sample', 'Sample', 'primary' if ready else 'secondary', True),
+                              ('cancel', 'Cancel', 'danger', True),
+                              ('_reserved', '', 'secondary', False)],
+                             top_button=('calibrate', 'Calibrate colors', 'secondary', False))
             key = poll_key(30)
             try:
                 window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
@@ -2476,9 +2688,17 @@ def calibrate_cube_colors():
                 return False
 
             if key == 32 and ready:
-                cx, cy, cw, ch = rects[4]       # center facelet, index 4 of the 9 in reading order
-                bgr = robust_facelet_color(frame, cx + cw//2, cy + ch//2)
-                new_calibration[color_name] = tuple(int(c) for c in bgr)
+                # every one of the 9 detected facelets is sampled (not just the center one) - the user was
+                # already asked to fill the whole frame with this single color, so all 9 are genuinely that
+                # color, and keeping all 9 as separate reference points (rather than averaging them into one)
+                # gives classify_bgr_to_6()/cube_colors_interpreted() several real points per color to match
+                # against instead of one, at no extra cost to the user.
+                # size=min(cw,ch): this exact facelet's own detected size, so sampling patches stay safely
+                # inside the actual sticker instead of risking the plastic/border around it (some cube brands
+                # have a visibly different-colored body between stickers, e.g. black or purple bezels) - see
+                # robust_facelet_color()'s own docstring.
+                new_calibration[color_name] = [tuple(int(c) for c in robust_facelet_color(frame, cx+cw//2, cy+ch//2, size=min(cw, ch)))
+                                                for (cx, cy, cw, ch) in rects]
                 sampled = True
 
     calibrated_colors = new_calibration
@@ -2488,7 +2708,12 @@ def calibrate_cube_colors():
     end_time = time.time() + 1.5
     while time.time() < end_time:
         frame, w, h = read_camera()
-        show_cube_frame(frame, h, 'Calibration saved!', [f'Saved to {os.path.basename(CALIBRATION_FILE)}'], [])
+        # same button-count/top_button padding as the sampling screen above, and for the same reason: keeps
+        # this brief confirmation screen from being yet another size the window has to visibly resize to.
+        show_cube_frame(frame, h, 'Calibration saved!', [f'Saved to {os.path.basename(CALIBRATION_FILE)}'],
+                         [('_reserved1', '', 'secondary', False), ('_reserved2', '', 'secondary', False),
+                          ('_reserved3', '', 'secondary', False)],
+                         top_button=('calibrate', 'Calibrate colors', 'secondary', False))
         cv2.waitKey(30)
 
     return True
@@ -2501,13 +2726,30 @@ def read_color(facelets, candidates, BGR_mean, H_mean, wait=20, index=0):
     ''' Reads the average BGR color on the each facelet of the cube face just detected.
     Draw the contour used on each facelect (eventually the facelet number), to feedback on correct facelet reading/ordering
     Wait is the time (in ms) to keep each facelet visible while the remaining frame is forced black
-    The fuction returns (or updates) global variables, like BGR_mean, hsv, hue, s, v, H_mean.'''
-    
+    The fuction returns (or updates) global variables, like BGR_mean, hsv, hue, s, v, H_mean.
+
+    When read_facelets() has just buffered+medianed several stable frames' worth of colors (see
+    _buffer_and_median_colors()), those combined values are used here instead of a fresh single-frame sample -
+    `facelets` is already order_9points()-sorted into the same 0-8 grid order the buffer was built in, so
+    index i here and position i in the buffer always mean the same facelet. Falls back to a live single-frame
+    sample (the original behavior) whenever no buffered set is available, e.g. read_facelets_fixed_grid()'s
+    capture path, which doesn't build one.'''
+
+    global _captured_median_colors
+    medians = _captured_median_colors
+    _captured_median_colors = None   # consumed once - only this specific capture should use it
+
     for facelet in facelets:                              # iteration over the 9 facelets just detedcted
         contour = facelet.get('contour')                  # contour of the facelet under analysis
         candidates.append(contour)                        # new contour is added to the candidates list
         cm_point=facelet['cx'],facelet['cy']                              # contour center coordinate
-        bgr_mean_sq = robust_facelet_color(frame, facelet['cx'], facelet['cy'])  # median of several patches, robust to a center logo
+        if medians is not None and index < len(medians):
+            bgr_mean_sq = medians[index]                  # combined (median-of-several-frames) color
+        else:
+            # this facelet's own detected side length (from its measured contour area), so sampling patches
+            # stay inside the actual sticker instead of the module-wide `edge` estimate - see robust_facelet_color()
+            facelet_size = facelet['area']**0.5 if facelet.get('area') else None
+            bgr_mean_sq = robust_facelet_color(frame, facelet['cx'], facelet['cy'], size=facelet_size)  # median of several patches, robust to a center logo
         BGR_mean.append(bgr_mean_sq)                          # Initially used a simpler mean to average the facelet color
         b,g,r = bgr_mean_sq                                   # BGR (avg) components are retrieved
         BGR_mean_sq = np.array([[[b,g,r]]], dtype=np.uint8)   # BGR are positioned in cv2 array form
@@ -2679,11 +2921,16 @@ def window_for_cube_solving(solution_Text, w, h, side, frame):
         if key in (ord('c'), ord('C')):  # enters interactive color calibration
             calibrate_cube_colors()
 
-        if key == 32:               # spacebar is used to move on to the next cube's side
+        if key == 32:               # spacebar (or the "Continue" button) is used to move on to the next cube's side
 #             clear_terminal()        # cleares the terminal
             side=0                  # cube side is set to zero to start a new cycle
             BGR_mean.clear()        # empties the dict previoously filled with 54 facelets colors
             H_mean.clear()          # empties the dict previoously filled with 54 facelets Hue
+            break                    # without this, the function never returns to its caller (cubeAF(), which
+                                     # itself resets `side`/restarts scanning right after calling this) - it
+                                     # just kept looping and re-showing this same Error screen forever, so
+                                     # "Continue" looked completely unresponsive no matter how many times it
+                                     # was clicked
 
 
 
@@ -3126,18 +3373,29 @@ def cubeAF():
                             window_closed = cv2.getWindowProperty('cube', cv2.WND_PROP_VISIBLE) < 1
                         except:
                             window_closed = False
-                        if window_closed or key == 27:  # ESC button, or window closed
+                        if window_closed or key == 27 or action == 'quit':  # ESC button, or window closed, or Close clicked
                             quit_func()                 # quit function is called
                             return cube_color_sequence, cube_status_string   # function is closed
-                        elif key == 32:                 # spacebar accepts this face
+                        elif key == 32 or action == 'accept':   # spacebar or Accept button accepts this face
                             accepted = True
-                        elif key in (ord('r'), ord('R')):  # 'r' rejects this face, to retry it
+                        # poll_action() (unlike poll_key()) returns the raw key, un-translated from a button
+                        # click - a click on Retry/Accept never actually produces key==32/ord('r'), only a real
+                        # keypress does, so this must also check `action` directly or those buttons do nothing.
+                        elif key in (ord('r'), ord('R')) or action == 'retry':  # 'r' or Retry rejects this face
                             retry_face = True
                         elif action is not None and action.startswith('edit_'):
                             idx = int(action[len('edit_'):])
-                            cur_name = classify_bgr_to_6(BGR_mean[-9+idx])[0]
+                            # look up which of the 6 canonical colors preview_face[idx] currently displays by
+                            # exact match, not by reclassifying BGR_mean through classify_bgr_to_6(): that
+                            # function measures against calibrated_colors when calibration data exists, which
+                            # can be skewed enough that DEFAULT_REF_COLORS[next_name] classifies back to a
+                            # DIFFERENT name than next_name - producing an infinite 2-color oscillation instead
+                            # of a clean cycle. preview_face[idx] is always exactly one of DEFAULT_REF_COLORS's
+                            # values (by construction, here and in classify_bgr_to_6()'s own return contract),
+                            # so an exact-value lookup is both correct and calibration-independent.
+                            cur_name = next(name for name, bgr in DEFAULT_REF_COLORS.items() if bgr == preview_face[idx])
                             next_name = CYCLE_COLORS[(CYCLE_COLORS.index(cur_name)+1) % len(CYCLE_COLORS)]
-                            BGR_mean[-9+idx] = DEFAULT_REF_COLORS[next_name]   # exact reference BGR: classifies back to next_name unambiguously
+                            BGR_mean[-9+idx] = DEFAULT_REF_COLORS[next_name]   # exact reference BGR
                             preview_face[idx] = DEFAULT_REF_COLORS[next_name]
 
                     if retry_face:                     # case the user asked to retry this face

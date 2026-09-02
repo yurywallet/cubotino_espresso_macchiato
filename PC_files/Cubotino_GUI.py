@@ -58,7 +58,7 @@ args = parser.parse_args()   # argument parsed assignement
 
 
 ################  processing arguments  #################################################################################
-print('\n\n\n===================  Cubotino_GUI AF (17 January 2024)  ============================')
+print('\n\n\n=================  Cubotino_GUI - CUBOTino espresso macchiato  =====================')
 debug = False                     # flag to enable/disable the debug related prints
 if args.debug != None:            # case 'debug' argument exists
     if args.debug:                # case the Cubotone.py has been launched with 'debug' argument
@@ -129,6 +129,7 @@ if not solver_found and not twophase_solver_found:    # case no one solver has b
 # python libraries, normally distributed with python
 import tkinter as tk                 # GUI library
 from tkinter import ttk              # GUI library
+import numpy as np                   # used to bake the flat/rounded button images (see _rounded_button_photo())
 import datetime as dt                # date and time library used as timestamp on a few situations (i.e. data log)
 import threading                     # threading library, to parallelize uart data 
 import time                          # time library is imported
@@ -536,23 +537,29 @@ def create_colorpick(a):
     
     cp = tk.Label(gui_canvas, text="color picking")      # gui text label informing the color picking concept
     cp.config(font=("Segoe UI", 18))                        # gui text font is set
-    
+
     # gui text label for color picking info is placed on the canvas, just below the F/R/B row's bottom edge
-    # (20 + 6*width + gap, per create_facelet_rects()'s own y formula for that row) and above the color
-    # circles' first row (2*gap + 7*width) - a fixed multiplier here previously drifted into overlapping one
-    # or the other depending on the value chosen, since it wasn't actually tied to either row's real position.
+    # (20 + 6*width + gap, per create_facelet_rects()'s own y formula for that row). The circles' start row is
+    # then anchored to this label's own MEASURED height (not a hand-estimated pixel guess) - a fixed guess
+    # here twice drifted into overlapping the label with the circles below it, apparently because the actual
+    # rendered label height varies with the display's DPI/font-scaling in a way a hardcoded pixel budget
+    # can't account for, while an actual measurement always reflects reality on any given screen.
     label_y = 20 + 6*width + gap + 10
     hp_window = gui_canvas.create_window(2*gap+int(8.25 * width), label_y, anchor="nw", window=cp)
-    
+    cp.update_idletasks()
+    circles_y0 = label_y + cp.winfo_reqheight() + 16     # 16px clear gap below the label's own real bottom edge
+
     for i in range(6):                                   # iteration over the six cube faces
         x = 2*gap + int((i % 3) * (a + 15) + 7.65 * a)   # x coordinate for a color palette widget
-        y = 2*gap + int((i // 3) * (a + 15) + 7 * a)     # y coordinate for a color palette widget
+        y = circles_y0 + (i // 3) * (a + 15)             # y coordinate for a color palette widget
         
-        # round widget, filled with color as per cols variable, and with tick border (20) of same gui background color
-        colorpick_id[i] = gui_canvas.create_oval(x, y, x + a, y + a, fill=cols[i], width=20, outline="#F0F0F0")
-        
-        # the first widget is modified by reducing the border width and changing the borger color to a different gray
-        gui_canvas.itemconfig(colorpick_id[0], width=5, outline="Grey55" ) 
+        # round widget, filled with color as per cols variable, with a thin ring in the unselected state. This
+        # used to be a 20px-wide ring - wider than the gap between circles (pitch a+15 vs a diameter), so
+        # neighboring circles' rings visually overlapped/fused together. A thin ring avoids that entirely.
+        colorpick_id[i] = gui_canvas.create_oval(x, y, x + a, y + a, fill=cols[i], width=3, outline="#D8DBE0")
+
+        # the first widget is modified to show the "selected" ring style instead (accent-colored, thicker)
+        gui_canvas.itemconfig(colorpick_id[0], width=4, outline=UI_ACCENT)
         curcol = cols[0]    # the first color of cols tupple is assigned to the (global) current color variable
 
 
@@ -1010,11 +1017,11 @@ def click(event):
         if idlist[0] in colorpick_id:                        # case the widget is one of the six color picking palette
             curcol = gui_canvas.itemcget("current", "fill")  # color selected at picking palette assigned "current color"
             for i in range(6):                               # iteration over all the six color picking palette widgets
-                # the circle widget is set to thick border with same color of the GUI background
-                gui_canvas.itemconfig(colorpick_id[i], width=20, outline="#F0F0F0")
-            
-            # the selected circle widget gets thinner borger, colored with a visible gray color
-            gui_canvas.itemconfig("current", width=5, fill=curcol, outline="Grey55")
+                # every circle back to its thin, unselected ring
+                gui_canvas.itemconfig(colorpick_id[i], width=3, outline="#D8DBE0")
+
+            # the selected circle widget gets the thicker accent-colored "selected" ring
+            gui_canvas.itemconfig("current", width=4, fill=curcol, outline=UI_ACCENT)
         
         elif idlist[0] in faceletter_id:                     # clicked directly on a face's U/R/F/D/L/B letter label:
             # the label is drawn on top of that center facelet, so a click landing on the letter glyph itself
@@ -1243,9 +1250,24 @@ def stop_robot():
 
 
 
+def _set_robot_btn_bg(bg):
+    """Sets b_robot's bg/activebackground, and records it as the button's "true" resting color for
+    _add_hover_feedback() to restore on mouse-leave. b_robot's color is reassigned in many places below
+    (unlike the rounded buttons, which never change color at runtime - see _round_button()'s own note on why
+    it's excluded from that), and if the mouse happens to be hovering when one of those reassignments happens,
+    a plain saved-at-hover-start snapshot goes stale: the hover-leave handler would restore the OLD color
+    instead of the new one gui_robot_btn_update() just set, so the button visibly reverts to a wrong color the
+    next time the mouse happens to leave it. Routing every bg change through here keeps that restore target
+    always current instead of a one-time snapshot."""
+
+    b_robot["bg"] = bg
+    b_robot["activebackground"] = bg
+    b_robot._true_bg = bg
+
+
 def gui_robot_btn_update():
     """Defines the Robot buttons state, for the robot related GUI part, according to some global variables """
-                             
+
     global serialData, cube_solving_string, robot_working, gui_buttons_state, just_stopped
 
     b_reset.grid_remove()   # currently unused - see the note by "Resume" support below
@@ -1257,8 +1279,8 @@ def gui_robot_btn_update():
             b_robot["text"] = "Reset"                     # usual disabled "no data" state, so the user has an
             b_robot["relief"] = "raised"                  # obvious way back to a clean GUI + physical robot state
             b_robot["state"] = "active"
-            b_robot["bg"] = "DodgerBlue2"                 # large robot button is blue colored, to stand out from
-            b_robot["activebackground"] = "DodgerBlue2"   # both the green "send" and red "stop" states
+            _set_robot_btn_bg("DodgerBlue2")              # large robot button is blue colored, to stand out from
+                                                            # both the green "send" and red "stop" states
             # "Resume" (continue from the exact stop point instead of starting over) was attempted here and
             # pulled back out before shipping: resume_solve() depends on cube_status, which is kept live by
             # animate_cube_sketch()'s cube_facelets_permutation() calls - and simulating that exact mechanism
@@ -1273,8 +1295,7 @@ def gui_robot_btn_update():
         elif not serialData:                                # case there is not serial communication set
             b_robot["relief"] = "sunken"                  # large robot button is lowered
             b_robot["state"] = "disable"                  # large robot button is disabled
-            b_robot["bg"] = UI_BTN_SECONDARY_BG           # large robot button is gray colored
-            b_robot["activebackground"] = UI_BTN_SECONDARY_BG  # large robot button is gray colored
+            _set_robot_btn_bg(UI_BTN_SECONDARY_BG)        # no ESP32 connection at all: plain gray
             if not "f)" in cube_solving_string:           # case the cube solution string has not robot moves
                 b_robot["text"] = "Robot:\nNo connection\nNo data" # large robot button text, to feedback the status
 
@@ -1286,23 +1307,24 @@ def gui_robot_btn_update():
             b_robot["text"] = "Robot:\nConnected\nNo data" # large robot button text, to feedback the status
             b_robot["relief"] = "sunken"                  # large robot button is lowered
             b_robot["state"] = "disable"                  # large robot button is disabled
-            b_robot["bg"] = UI_BTN_SECONDARY_BG           # large robot button is gray colored
-            b_robot["activebackground"] = UI_BTN_SECONDARY_BG  # large robot button is gray colored
+            # still gray-toned (there's genuinely nothing to send yet, so it stays non-clickable) but a pale
+            # green rather than the same neutral gray as "no connection at all" - the ESP32 IS connected here,
+            # and that success shouldn't look identical to not being connected.
+            _set_robot_btn_bg("#C8E6C9")
 
         # case there serial communication is set, and there are robot moves on cube solving string
         elif serialData and "f)" in cube_solving_string and not "(0" in cube_solving_string:
             b_robot["text"] = "Solve"                     # large robot button text, to feedback the status
             b_robot["relief"] = "raised"                  # large robot button is raised
             b_robot["state"] = "active"                   # large robot button is activated
-            b_robot["bg"] = "OliveDrab1"                  # large robot button is green colored
-            b_robot["activebackground"] = "OliveDrab1"    # large robot button is green colored
+            _set_robot_btn_bg("#4CAF50")                  # large robot button is a friendlier, brighter green
+                                                            # (was the duller/muddier "OliveDrab1")
 
     if robot_working:                                     # case the robot is working
         b_robot["text"] = "STOP\nROBOT"                   # large robot button text, to feedback the status
         b_robot["relief"] = "raised"                      # large robot button is raised
         b_robot["state"] = "active"                       # large robot button is activated
-        b_robot["bg"] = "orange red"                      # large robot button is red colored
-        b_robot["activebackground"] = "orange red"        # large robot button is red colored
+        _set_robot_btn_bg("orange red")                   # large robot button is red colored
         
         if gui_buttons_state!="disable":                  # case the robot is not disabled
             gui_buttons_state = gui_buttons_for_cube_status("disable") # buttons for cube status part are disabled
@@ -1736,7 +1758,12 @@ def update_coms():
     clicked_com.set(coms[0])                        # activates first drop down menu position (not a serial port)
     b_drop_COM = tk.OptionMenu(gui_robot_label, clicked_com, *coms, command=connect_check) # populated drop down menu
     b_drop_COM.config(width=7, font=("Segoe UI", "10"))        # drop down menu settings
-    b_drop_COM.grid(column=0, row=8, sticky="e", padx=10)   # drop down menu settings
+    # sticky="ew" (not "w"): an OptionMenu's own natural width doesn't line up with a same-"width=" Button's
+    # (different widget types, different internal padding/border), so anchoring it to one side by width alone
+    # kept landing off by a few pixels either way. Stretching it to fill the full column - the same column
+    # b_refresh/b_connect (both sticky="w", so they set the column's width) already occupy - ties its actual
+    # rendered left/right edges directly to theirs instead of to its own separately-computed natural size.
+    b_drop_COM.grid(column=0, row=8, sticky="ew", padx=10, pady=5)
     connect_check(0)                                        # updates the button Connect status
     gui_robot_btn_update()                                  # updates the cube related buttons status
 
@@ -2364,27 +2391,38 @@ except:
 
 
 # ---------------------------------------------------------------------------------------------------------
-# Shared UI theme, matching the webcam window's sidebar design (Cubotino_webcam.py's SIDEBAR_BG/TEXT_PRIMARY/
-# ACCENT/etc, same BGR values converted to RGB hex here). This is UI chrome only - button/label/frame colors
-# and fonts - and must never be confused with the cube's own 6 facelet colors (the color-picker circles, the
-# cube sketch's facelet fills, gray_cols/base_cols/cols) which stay exactly as the solver expects them.
+# Shared UI theme. The actual token values live in Cubotino_theme.py - the single source of truth imported by
+# both this file and Cubotino_webcam.py (which converts the same hex values to BGR for its cv2-drawn sidebar),
+# so the two windows can't drift out of sync the way two independently hand-maintained copies eventually will.
+# The UI_* names below are kept as-is (rather than rewriting every call site to theme.BG etc.) purely to avoid
+# touching the many places already using them; every current color/font is unchanged, just re-sourced.
+# This is UI chrome only - button/label/frame colors and fonts - and must never be confused with the cube's
+# own 6 facelet colors (the color-picker circles, the cube sketch's facelet fills, gray_cols/base_cols/cols)
+# which stay exactly as the solver expects them.
 # option_add() sets a default for every widget of that Tk class going forward; a widget's own explicit
 # .config(bg=...)/font=... (there are a few, e.g. state-indicator buttons) still overrides this default, same
 # as CSS specificity - those are updated individually below where their color also carries meaning.
 # ---------------------------------------------------------------------------------------------------------
-UI_BG = '#F5F7F7'
-UI_TEXT_PRIMARY = '#232323'
-UI_TEXT_SECONDARY = '#6E6E6E'
-UI_ACCENT = '#1E78C8'
-UI_ACCENT_ACTIVE = '#175f9f'
-UI_DANGER = '#D23C3C'
-UI_BTN_SECONDARY_BG = '#DEDEDE'
-UI_BTN_SECONDARY_ACTIVE = '#CFCFCF'
-UI_FONT_FAMILY = 'Segoe UI'
-UI_FONT = (UI_FONT_FAMILY, 11)
-UI_FONT_BOLD = (UI_FONT_FAMILY, 12, 'bold')
+import Cubotino_theme as theme
 
-root.configure(bg=UI_BG)
+UI_BG = theme.BG
+UI_PAGE_BG = theme.PAGE_BG     # darker "page" tone for the outermost window - everywhere content doesn't
+                                # reach (e.g. the window resized wider than its content) shows this instead of
+                                # blending seamlessly into the same flat tone as the actual content panels.
+UI_TEXT_PRIMARY = theme.TEXT_PRIMARY
+UI_TEXT_SECONDARY = theme.TEXT_SECONDARY
+UI_ACCENT = theme.ACCENT               # indigo
+UI_ACCENT_ACTIVE = theme.ACCENT_ACTIVE
+UI_DANGER = theme.DANGER
+UI_DANGER_ACTIVE = theme.DANGER_ACTIVE
+UI_BTN_SECONDARY_BG = theme.BTN_SECONDARY_BG           # noticeably darker than UI_BG on purpose - too close
+UI_BTN_SECONDARY_ACTIVE = theme.BTN_SECONDARY_ACTIVE   # to the panel behind it reads as "not a button"
+UI_FONT_FAMILY = theme.FONT_FAMILY
+UI_FONT = theme.FONT
+UI_FONT_BOLD = theme.FONT_BOLD
+UI_FONT_TITLE = theme.FONT_TITLE
+
+root.configure(bg=UI_PAGE_BG)
 for widget_class in ('Frame', 'Label', 'Labelframe', 'Checkbutton', 'Radiobutton', 'Scale', 'Canvas'):
     root.option_add(f'*{widget_class}.Background', UI_BG)
 root.option_add('*Label.Foreground', UI_TEXT_PRIMARY)
@@ -2401,9 +2439,20 @@ root.option_add('*Button.Foreground', UI_TEXT_PRIMARY)
 root.option_add('*Button.ActiveBackground', UI_BTN_SECONDARY_ACTIVE)
 root.option_add('*Button.ActiveForeground', UI_TEXT_PRIMARY)
 root.option_add('*Button.DisabledForeground', UI_TEXT_SECONDARY)
-root.option_add('*Button.relief', 'raised')   # a visible bevel reads as clickable; 'flat' looked like a label.
-root.option_add('*Button.borderWidth', 2)     # raised relief also gives Tk's native press animation for free -
-                                               # a button visibly sinks while the mouse is held down on it.
+# flat, borderless fill is the deliberate modern look here (a visible bevel read as more "clickable" in an
+# earlier pass, but a hard 3D border reads as dated once the rest of the app goes flat/minimal) - clickability
+# instead comes from solid color contrast, generous padding, a hand cursor, and the hover darkening added by
+# _add_hover_feedback() below (Tk buttons otherwise only react to an actual press, not to hover).
+root.option_add('*Button.relief', 'flat')
+root.option_add('*Button.borderWidth', 0)
+root.option_add('*Button.padX', 14)
+root.option_add('*Button.padY', 6)
+root.option_add('*Button.Cursor', 'hand2')
+# a focused button draws a dashed keyboard-focus rectangle right at its own edge; on a _round_button() image
+# that rectangle is still a hard square, so its corners visibly poke out past the rounded corners underneath.
+# This app is mouse-driven (no keyboard tab-navigation is relied on anywhere), so focus traversal isn't
+# needed - disabling it removes that artifact everywhere at once.
+root.option_add('*Button.takeFocus', 0)
 root.option_add('*Font', UI_FONT)
 
 
@@ -2416,6 +2465,237 @@ def style_secondary_button(btn):
 
     btn.configure(bg=UI_BTN_SECONDARY_BG, fg=UI_TEXT_PRIMARY, activebackground=UI_BTN_SECONDARY_ACTIVE,
                   activeforeground=UI_TEXT_PRIMARY, disabledforeground=UI_TEXT_SECONDARY)
+
+
+def add_tooltip(widget, text, wraplength=260):
+    """Attaches a small hover tooltip to any widget - Tkinter has no built-in tooltip, so this is the
+    standard pattern: a borderless Toplevel, shown near the cursor a moment after the mouse enters, hidden the
+    moment it leaves (or the widget is clicked/destroyed). Used for settings whose purpose isn't obvious from
+    their label alone (e.g. "estimate facelets (beta version)"), instead of the user having to ask what a
+    checkbox does."""
+
+    tip = {'win': None}
+
+    def show(event=None):
+        if tip['win'] is not None:
+            return
+        x = widget.winfo_rootx() + 16
+        y = widget.winfo_rooty() + widget.winfo_height() + 6
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)   # no title bar/border - just the tooltip content
+        win.wm_geometry(f"+{x}+{y}")
+        try:
+            win.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        label = tk.Label(win, text=text, justify="left", wraplength=wraplength, bg='#2B2F38', fg='white',
+                          font=(UI_FONT_FAMILY, 9), padx=8, pady=6)
+        label.pack()
+        tip['win'] = win
+
+    def hide(event=None):
+        if tip['win'] is not None:
+            tip['win'].destroy()
+            tip['win'] = None
+
+    widget.bind('<Enter>', show, add='+')
+    widget.bind('<Leave>', hide, add='+')
+    widget.bind('<Button-1>', hide, add='+')
+    widget.bind('<Destroy>', hide, add='+')
+
+
+def _darken(widget, color, factor=0.88):
+    """Returns `color` (any Tk color spec - hex or name) darkened by `factor`, as a hex string."""
+
+    r, g, b = widget.winfo_rgb(color)   # each channel 0-65535
+    r, g, b = int(r/256*factor), int(g/256*factor), int(b/256*factor)
+    return '#{:02x}{:02x}{:02x}'.format(max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+
+
+def _hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _rounded_mask(w, h, r, supersample=4):
+    """Coverage (0..1) of a WxH rounded rect with corner radius r, at each pixel - anti-aliased by rendering
+    at `supersample`x resolution and box-downsampling. A pixel is inside the shape when its distance to the
+    nearest point of the radius-inset rectangle is <= r (the standard rounded-rect distance test); this is
+    plain numpy rather than a drawing library, since Tk's own PhotoImage can load raw PPM bytes directly."""
+
+    w, h = max(1, w), max(1, h)
+    r = max(0, min(r, w//2, h//2))
+    W, H, R = w*supersample, h*supersample, r*supersample
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    qx = np.maximum(np.maximum(R - xx, xx - (W-1) + R), 0)
+    qy = np.maximum(np.maximum(R - yy, yy - (H-1) + R), 0)
+    inside = (qx**2 + qy**2) <= R*R
+    return inside.astype(np.float32).reshape(h, supersample, w, supersample).mean(axis=(1, 3))
+
+
+def _rounded_button_photo(w, h, radius, fill_hex, bg_hex):
+    """A tk.PhotoImage of a filled, anti-aliased rounded rectangle, composited against bg_hex (the color it
+    will actually sit on - PPM has no alpha channel, so true transparency isn't an option here, but baking in
+    the exact surrounding color is visually indistinguishable for a button on a flat-colored panel)."""
+
+    alpha = _rounded_mask(w, h, radius)[..., None]
+    fill = np.array(_hex_to_rgb(fill_hex), dtype=np.float32)
+    bg = np.array(_hex_to_rgb(bg_hex), dtype=np.float32)
+    arr = (alpha*fill + (1-alpha)*bg).astype(np.uint8)
+    ppm = 'P6 {} {} 255 '.format(w, h).encode('ascii') + arr.tobytes()
+    return tk.PhotoImage(data=ppm)
+
+
+def _round_button(btn, fill_hex, hover_hex, bg_hex=None, radius=10):
+    """Gives a tk.Button real rounded corners via a baked rounded-rect image (Tk buttons have no native corner-
+    radius option). Only suitable for buttons whose fill color is fixed at setup time - b_robot is
+    deliberately left a plain flat rectangle, since its background is reassigned to many different colors
+    throughout the code (gui_robot_btn_update() etc.) to signal robot state; each of those call sites would
+    need reworking to regenerate an image instead of just setting bg, which is out of scope here.
+    Must be called after the button has its final on-screen size (i.e. once the whole GUI is laid out) -
+    winfo_reqwidth/height (the requested size) is used rather than winfo_width/height so this still works for
+    a button that's grid_remove()'d at call time (e.g. b_reset, hidden until after a Stop)."""
+
+    bg_hex = bg_hex or UI_BG
+    w, h = btn.winfo_reqwidth(), btn.winfo_reqheight()
+    # critical: a tk.Button's width/height options mean "characters of text" with no image, but silently
+    # switch to meaning PIXELS once an image is attached - the button was originally created with e.g.
+    # width=12 meaning "12 characters" (~100px); left unset at configure time, attaching the image
+    # reinterpreted that same "12" as 12 PIXELS, crushing every rounded button down to a sliver with clipped
+    # text. Re-pinning width/height to the pre-image outer size isn't quite enough either: Tk then adds
+    # padx/pady (and border/highlight thickness) AGAIN on top of an image-sized width/height, inflating the
+    # button beyond its neighbors - so the image needs generating smaller, inset by exactly that padding.
+    #
+    # That padding overhead was previously computed from the configured padx/pady option (a fixed number like
+    # 14), which matches the actual rendered overhead only at 100% display scaling - at any other DPI setting
+    # Tk's actual padding grows with it while the raw configured number doesn't, so the image ended up too
+    # small and a visible margin of the button's own flat native background showed around the rounded corners
+    # instead of blending into the panel behind it. Fixed two ways, either of which now independently prevents
+    # a visible mismatch even if the other one doesn't land exactly right:
+    #  1) the image size is derived by MEASURING the real overshoot on this system (probe with a full-size
+    #     image, see how much bigger Tk actually reports the button as) instead of predicting it from a
+    #     configuration value - correct regardless of DPI/theme/font-rendering differences.
+    #  2) the button's own native bg is set to bg_hex (the same color baked into the image's own background) -
+    #     so ANY sliver of that native background that ends up showing anyway is the *correct* color, matching
+    #     the panel behind it, rather than the button's old unrelated flat-gray/accent fill.
+    btn.configure(highlightthickness=0, bd=0, bg=bg_hex, activebackground=bg_hex)
+    probe_img = _rounded_button_photo(max(1, w), max(1, h), radius, fill_hex, bg_hex)
+    btn.configure(image=probe_img, compound='center', width=w, height=h)
+    btn.update_idletasks()
+    overshoot_w = max(0, btn.winfo_reqwidth() - w)
+    overshoot_h = max(0, btn.winfo_reqheight() - h)
+
+    img_w, img_h = max(1, w - overshoot_w), max(1, h - overshoot_h)
+    normal_img = _rounded_button_photo(img_w, img_h, radius, fill_hex, bg_hex)
+    hover_img = _rounded_button_photo(img_w, img_h, radius, hover_hex, bg_hex)
+    btn.configure(image=normal_img, compound='center', width=img_w, height=img_h)
+    # takefocus is also set directly here (not only via the '*Button.takeFocus' option-database entry
+    # elsewhere), in case that pattern isn't matching reliably - this button showing corner "brackets" (a
+    # dashed keyboard-focus rectangle peeking past the rounded corners) after being clicked means whatever
+    # gave it focus wasn't actually blocked by the option-database rule alone.
+    btn.configure(takefocus=0)
+    # belt-and-suspenders: a plain tk.Button can still be given focus by a mouse click even with takefocus=0
+    # (that option only excludes it from Tab-key traversal) - if it ever does gain focus, immediately hand it
+    # back to the button's own parent, before Tk's next redraw has a chance to paint the dashed focus rectangle.
+    btn.bind('<FocusIn>', lambda event, b=btn: b.master.focus_set())
+    btn._rounded_normal_img = normal_img   # keep references alive - PhotoImage is garbage-collected otherwise
+    btn._rounded_hover_img = hover_img
+
+
+def _add_hover_feedback(widget):
+    """Recursively binds every tk.Button under `widget` so it visibly reacts on mouse-over: swaps to its
+    rounded hover-image variant for buttons _round_button() has processed, or darkens its flat bg slightly for
+    any other (still-rectangular) button. Flat buttons with no bevel give no visual hint of interactivity
+    until actually pressed - this is the hand-cursor's companion cue (see '*Button.Cursor' above), added once
+    after the whole GUI tree is built."""
+
+    for child in widget.winfo_children():
+        if isinstance(child, tk.Button):
+            if hasattr(child, '_rounded_normal_img'):
+                def on_enter(event, b=child):
+                    if str(b['state']) != 'disabled':
+                        b.configure(image=b._rounded_hover_img)
+                def on_leave(event, b=child):
+                    b.configure(image=b._rounded_normal_img)
+            else:
+                # b_robot (the only button still on this path - everything else goes through _round_button())
+                # has its bg reassigned constantly at runtime (connected/disconnected/ready/working/etc, see
+                # gui_robot_btn_update()). A plain "remember the bg when the mouse entered, restore that same
+                # value when it leaves" doesn't hold up here: if gui_robot_btn_update() changes the color WHILE
+                # the mouse happens to still be over the button, that snapshot goes stale, and leaving restores
+                # the OLD color, undoing the real state change. So instead of snapshotting once, both handlers
+                # read/write `_true_bg` - the single current "what this button should look like at rest" value,
+                # which _set_robot_btn_bg() (Cubotino_GUI.py) keeps current on every real color change,
+                # independent of whatever the hover darken/restore cycle is doing to the widget's literal bg.
+                def on_enter(event, b=child):
+                    if str(b['state']) != 'disabled':
+                        true_bg = getattr(b, '_true_bg', None) or b['bg']
+                        b._true_bg = true_bg
+                        try:
+                            b.configure(bg=_darken(b, true_bg))
+                        except tk.TclError:
+                            pass
+                def on_leave(event, b=child):
+                    true_bg = getattr(b, '_true_bg', None)
+                    if true_bg is not None:
+                        b.configure(bg=true_bg)
+            child.bind('<Enter>', on_enter, add='+')
+            child.bind('<Leave>', on_leave, add='+')
+        _add_hover_feedback(child)
+
+
+def _canvas_rounded_rect(canvas, x1, y1, x2, y2, r, **kwargs):
+    """A rounded rectangle on a tk.Canvas, via the standard smoothed-polygon recipe (Canvas has no native
+    rounded-rect item either, but create_polygon(..., smooth=True) spline-smooths through a corner-cut point
+    list into one). Returns the created item id."""
+
+    points = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y2-r, x2, y2, x2-r, y2,
+              x1+r, y2, x1, y2, x1, y2-r, x1, y1+r, x1, y1]
+    return canvas.create_polygon(points, smooth=True, **kwargs)
+
+
+def _wrap_in_rounded_panel(labelframe, parent, grid_kwargs, margin=10, radius=14, bg_hex=None):
+    """Gives a tk.LabelFrame rounded corners it can't have natively: embeds it inside a tk.Canvas (gridded
+    into `parent` with `grid_kwargs`, in place of gridding labelframe there directly) that draws a rounded
+    backdrop matching labelframe's size plus `margin`, so the rounded corners peek out past its square edges.
+    labelframe's own border is suppressed (bd=0/flat) so the canvas's rounded one is the only visible one; its
+    content and every child widget are completely unaffected - only its own top-level .grid() call changes.
+
+    The backdrop is NOT sized once at startup: labelframe is bound to <Configure> (fires whenever its actual
+    size changes, from any cause - a button being grid()'d/grid_remove()'d in or out, text changing, anything)
+    and the canvas is resized/redrawn from its live winfo_reqwidth/height every time. A one-shot size computed
+    at startup would go stale the moment content changed later - exactly the class of bug that briefly broke
+    the rounded buttons earlier in this same redesign - so this recomputes from the actual current size on
+    every change instead of assuming a fixed one. Verified against exactly that scenario (a button appearing/
+    disappearing inside the panel) in test_rounded_panel.py before shipping."""
+
+    bg_hex = bg_hex or UI_PAGE_BG
+    canvas = tk.Canvas(parent, highlightthickness=0, bg=bg_hex)
+    canvas.grid(**grid_kwargs)
+    labelframe.configure(bd=0, highlightthickness=0, relief='flat')
+    win_id = canvas.create_window(margin, margin, anchor='nw', window=labelframe)
+    last_size = [0, 0]
+
+    def redraw(event=None):
+        labelframe.update_idletasks()
+        w, h = labelframe.winfo_reqwidth(), labelframe.winfo_reqheight()
+        if [w, h] == last_size:
+            return
+        last_size[0], last_size[1] = w, h
+        cw, ch = w + 2*margin, h + 2*margin
+        canvas.configure(width=cw, height=ch)
+        canvas.delete('backdrop')
+        _canvas_rounded_rect(canvas, 0, 0, cw-1, ch-1, radius, fill=UI_BG, outline='', tags='backdrop')
+        canvas.tag_lower('backdrop', win_id)
+
+    labelframe.bind('<Configure>', redraw)
+    redraw()
+    canvas._panel_redraw = redraw   # exposed so a final explicit call can be forced once the whole GUI (and
+                                     # therefore every child this labelframe will ever contain) is built - Tk
+                                     # coalesces geometry-change events, so relying purely on <Configure> firing
+                                     # once per intermediate child added while dozens more get added later in
+                                     # the same setup script isn't guaranteed to land on the truly final size.
+    return canvas
 
 
 # calculate x and y coordinates for the Tk root window starting coordinate
@@ -2453,8 +2733,11 @@ root.rowconfigure(0, weight=1)                 # root is set to have 1 row of  w
 root.columnconfigure(0,weight=1)               # root is set to have 1 column of weight=1
 
 # two windows
-mainWindow=tk.Frame(root)                      # a first windows (called mainWindow) is derived from root
-settingWindow=tk.Frame(root)                   # a second windows (called settingWindow) is derived from root
+mainWindow=tk.Frame(root, bg=UI_PAGE_BG)       # a first windows (called mainWindow) is derived from root
+settingWindow=tk.Frame(root, bg=UI_PAGE_BG)    # a second windows (called settingWindow) is derived from root
+# both explicitly override the page tone rather than inheriting UI_BG from the broad *Frame.Background rule
+# above, so the "page" they sit on reads as a distinct backdrop behind the lighter UI_BG content panels
+# (gui_f1/gui_f2 and everything in them) instead of everything blending into one flat tone.
 for window in (mainWindow, settingWindow):     # iteration over the two defined windows
     window.grid(row=0,column=0,sticky='nsew')  # each window goes to the only row/column, and centered
 
@@ -2484,14 +2767,21 @@ root.bind("<MouseWheel>", scroll)             # scrol up of the mouse wheel call
 # ############################### GUI low level part ###################################################################
 # ############################### Main windows widget ##################################################################
 
-# gui text windows for feedback messages
-gui_text_window = tk.Text(gui_canvas,highlightthickness=0)
+# gui text windows for feedback messages - a thin defined border keeps this readable as a bordered output
+# panel rather than an unstyled blank rectangle when it's empty (its own bg stays white: a distinctly "text
+# console" look against the surrounding light-gray card is intentional, not a leftover default)
+gui_text_window = tk.Text(gui_canvas, highlightthickness=1, highlightbackground='#D8DBE0',
+                           highlightcolor='#D8DBE0', relief='flat', bd=0)
 gui_text_window.place(x=20+6*width+10+2*gap, y=20, height=3*width-10, width=6*width-10)
 
 
 # cube status and solve buttons
 cube_status_label = tk.LabelFrame(gui_f2, text="Cube status", labelanchor="nw", font=("Segoe UI", "12"))
 cube_status_label.grid(column=0, row=0, columnspan=2, sticky="w", padx=10, pady=10)
+# NOTE: rounded-panel wrapping (_wrap_in_rounded_panel) was tried here and reverted - it passed every
+# isolated/integration test written for it, but broke this panel's actual visibility in the real app (went
+# completely blank) for a reason not yet root-caused. Reverted to a plain LabelFrame rather than risk shipping
+# broken UI a second time; the helper function is left in place, unused, for whoever revisits this.
 
 
 # radiobuttons for cube status source
@@ -2527,8 +2817,16 @@ b_random.grid(column=0, row=4, padx=10, pady=10, sticky="w")
 
 # checkbuttons for cube scrambling
 def update_read_solve_label():
-    """Relabels the primary action button to make clear it scrambles (rather than solves) while scramble mode is on."""
-    b_read_solve.config(text="Scramble" if gui_scramble_var.get() else "Read &\nsolve")
+    """Relabels the primary action button: "Scramble" while scramble mode is on (takes priority over the read
+    mode - matches solve()'s own precedence), else "Scan &\\nsolve" when reading from the webcam vs
+    "Read &\\nsolve" for the screen sketch, since "Read" doesn't really describe pointing a camera at a cube."""
+    if gui_scramble_var.get():
+        text = "Scramble"
+    elif gui_read_var.get() == "webcam":
+        text = "Scan &\nsolve"
+    else:
+        text = "Read &\nsolve"
+    b_read_solve.config(text=text)
 
 gui_scramble_var = tk.BooleanVar()
 cb_scramble=tk.Checkbutton(cube_status_label, text="scramble", variable=gui_scramble_var, command=update_read_solve_label)
@@ -2536,10 +2834,17 @@ cb_scramble.configure(font=("Segoe UI", "10"))
 cb_scramble.grid(column=1, row=4, sticky="ew", padx=5, pady=5)
 gui_scramble_var.set(0)
 
+gui_read_var.trace_add('write', lambda *args: update_read_solve_label())  # also catches the programmatic
+                                                                            # gui_read_var.set() calls elsewhere
+                                                                            # (clean(), random(), etc), not just
+                                                                            # a direct radiobutton click
+update_read_solve_label()   # sets the correct initial label now that gui_read_var/gui_scramble_var both exist
+
 
 # robot related buttons
 gui_robot_label = tk.LabelFrame(gui_f2, text="Robot", labelanchor="nw", font=("Segoe UI", "12"))
 gui_robot_label.grid(column=0, row=6, rowspan=11, columnspan=2, sticky="n", padx=10, pady=10)
+# NOTE: see the matching comment above cube_status_label's grid() - rounded-panel wrapping reverted here too.
 
 b_robot = tk.Button(gui_robot_label, text="Robot", command=robot_solver, height=6, width=11)
 b_robot.configure(font=("Segoe UI", "12"), relief="sunken", state="disable")
@@ -2591,6 +2896,9 @@ b_settings.grid(column=0, row=13, columnspan=2,  padx=10, pady=5)
 b_back = tk.Button(settingWindow, text="Main page", #fg='red', activeforeground= 'red',
                    height=1, width=12, state="active", command= lambda: show_window(mainWindow))
 b_back.configure(font=("Segoe UI", "12"))
+style_secondary_button(b_back)   # option_add-only coloring rendered near-black on this Windows/Tk combo for
+                                  # some buttons regardless of state toggling (the bug style_secondary_button()
+                                  # was written for elsewhere) - explicit colors sidestep it here too.
 b_back.grid(row=0, column=2, sticky="w", padx=20, pady=10)
 
 
@@ -2599,29 +2907,22 @@ b_back.grid(row=0, column=2, sticky="w", padx=20, pady=10)
 b_get_settings = tk.Button(settingWindow, text="Get current CUBOTino settings", height=1, width=26,
                            state="active", command= get_current_servo_settings)
 b_get_settings.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_get_settings)
 b_get_settings.grid(row=0, column=0, sticky="w", padx=20, pady=10)
 
 
 b_send_settings = tk.Button(settingWindow, text="Send new settings to CUBOTino", height=1, width=26,
                            state="active", command= send_new_servo_settings)
 b_send_settings.configure(font=("Segoe UI", "11"))
+style_secondary_button(b_send_settings)
 b_send_settings.grid(row=0, column=1, sticky="w", padx=20, pady=10)
 
 
-#### estimate facelets check button ####
-checkVar2 = tk.IntVar()
-c_estimate = tk.Checkbutton(settingWindow, text = "estimate facelets \n(beta version)", variable = checkVar2,
-                            command=estimate_fclts_check, onvalue = 1, offvalue = 0)
-c_estimate.configure(font=("Segoe UI", "11"))
-c_estimate.grid(row=0, column=3, sticky="w", padx=20, pady=10)
-
-
-#### debug check button ####
-checkVar1 = tk.IntVar()
-c_debug = tk.Checkbutton(settingWindow, text = "debug print-out\n(webcam)", variable = checkVar1,
-                         command=debug_check, onvalue = 1, offvalue = 0)
-c_debug.configure(font=("Segoe UI", "11"))
-c_debug.grid(row=0, column=4, sticky="w", padx=20, pady=10)
+# the "estimate facelets" and "debug print-out" checkboxes used to sit here, floating next to the unrelated
+# Get/Send-settings buttons with no context for what they actually do - both are webcam-scanning options, so
+# they're now grouped into the "Webcam" section below (with the camera/resolution/scan-mode settings they
+# actually belong next to) and have hover tooltips explaining them - see checkVar2/c_estimate and
+# checkVar1/c_debug further down.
 
 
 #### servos min and max pulse width widgets ####
@@ -2662,6 +2963,7 @@ gui_var_b_srv_pw.set(b_srv_pw_range)
 # button to process the servos pulse width choice
 pw_update_btn = tk.Button(srv_pw_label, text="confirm\nchanges", height=2, width=18, state="active", command= pw_update)
 pw_update_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(pw_update_btn)
 pw_update_btn.grid(row=2, column=5, sticky="w", padx=15, pady=10)
 
 
@@ -2698,15 +3000,22 @@ s_top_srv_release.set(t_servo_close)
 
 flip_btn = tk.Button(top_srv_label, text="FLIP  (toggle)", height=1, width=18, state="active", command= flip_cube)
 flip_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(flip_btn)
 flip_btn.grid(row=5, column=0, sticky="w", padx=15, pady=10)
 
 open_btn = tk.Button(top_srv_label, text="OPEN", height=1, width=18, state="active", command= open_top_cover)
 open_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(open_btn)
 open_btn.grid(row=5, column=1, sticky="w", padx=15, pady=10)
 
-close_btn = tk.Button(top_srv_label, text="CLOSE", height=1, width=18, state="active", command= close_top_cover)
-close_btn.configure(font=("Segoe UI", "12"))
-close_btn.grid(row=5, column=2, sticky="w", padx=15, pady=10)
+top_close_btn = tk.Button(top_srv_label, text="CLOSE", height=1, width=18, state="active", command= close_top_cover)
+top_close_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(top_close_btn)
+top_close_btn.grid(row=5, column=2, sticky="w", padx=15, pady=10)
+# named distinctly from the bottom-servo "HOME" button below (which used to share this exact variable name,
+# close_btn - harmless as long as nothing needed to reference the top-cover one again afterward, but the
+# final rounding pass at the end of this file needs to reference every button by a name that still resolves
+# to the right widget, so the collision had to go)
 
 
 s_top_srv_flip_to_close_time = tk.Scale(top_srv_label, label="TIME: flip > close (ms)", font=('Segoe UI','11'),
@@ -2776,34 +3085,48 @@ s_btm_srv_extra_home.grid(row=8, column=4, sticky="w", padx=12, pady=5)
 s_btm_srv_extra_home.set(b_extra_home)
 
 
+def _jog_button(parent, label, command):
+    """A small +/- jog button, styled the same way every other secondary button in this window is (see
+    style_secondary_button()'s own docstring for why that's needed rather than relying on option_add alone)."""
+    btn = tk.Button(parent, text=label, width=3, command=command)
+    style_secondary_button(btn)
+    btn.pack(side="left", padx=3)
+    return btn
+
+_jog_btns = []   # collected so the final rounding pass (end of file) can round these too, alongside every
+                 # other settings-window button - _jog_button() already returns the widget for this purpose
+
 s_btm_srv_CCW_jog = tk.Frame(b_srv_label)
 s_btm_srv_CCW_jog.grid(row=9, column=0)
-tk.Button(s_btm_srv_CCW_jog, text="−", width=3, command=lambda: jog_bottom(s_btm_srv_CCW, -1)).pack(side="left", padx=3)
-tk.Button(s_btm_srv_CCW_jog, text="+", width=3, command=lambda: jog_bottom(s_btm_srv_CCW, 1)).pack(side="left", padx=3)
+_jog_btns.append(_jog_button(s_btm_srv_CCW_jog, "−", lambda: jog_bottom(s_btm_srv_CCW, -1)))
+_jog_btns.append(_jog_button(s_btm_srv_CCW_jog, "+", lambda: jog_bottom(s_btm_srv_CCW, 1)))
 
 s_btm_srv_home_jog = tk.Frame(b_srv_label)
 s_btm_srv_home_jog.grid(row=9, column=1)
-tk.Button(s_btm_srv_home_jog, text="−", width=3, command=lambda: jog_bottom(s_btm_srv_home, -1)).pack(side="left", padx=3)
-tk.Button(s_btm_srv_home_jog, text="+", width=3, command=lambda: jog_bottom(s_btm_srv_home, 1)).pack(side="left", padx=3)
+_jog_btns.append(_jog_button(s_btm_srv_home_jog, "−", lambda: jog_bottom(s_btm_srv_home, -1)))
+_jog_btns.append(_jog_button(s_btm_srv_home_jog, "+", lambda: jog_bottom(s_btm_srv_home, 1)))
 
 s_btm_srv_CW_jog = tk.Frame(b_srv_label)
 s_btm_srv_CW_jog.grid(row=9, column=2)
-tk.Button(s_btm_srv_CW_jog, text="−", width=3, command=lambda: jog_bottom(s_btm_srv_CW, -1)).pack(side="left", padx=3)
-tk.Button(s_btm_srv_CW_jog, text="+", width=3, command=lambda: jog_bottom(s_btm_srv_CW, 1)).pack(side="left", padx=3)
+_jog_btns.append(_jog_button(s_btm_srv_CW_jog, "−", lambda: jog_bottom(s_btm_srv_CW, -1)))
+_jog_btns.append(_jog_button(s_btm_srv_CW_jog, "+", lambda: jog_bottom(s_btm_srv_CW, 1)))
 
 
 CCW_btn = tk.Button(b_srv_label, text="CCW", height=1, width=18, state="active", command= ccw)
 CCW_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(CCW_btn)
 CCW_btn.grid(row=10, column=0, sticky="w", padx=15, pady=10)
 
 
 close_btn = tk.Button(b_srv_label, text="HOME", height=1, width=18, state="active", command= home)
 close_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(close_btn)
 close_btn.grid(row=10, column=1, sticky="w", padx=15, pady=10)
 
 
 CW_btn = tk.Button(b_srv_label, text="CW", height=1, width=18, state="active", command= cw)
 CW_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(CW_btn)
 CW_btn.grid(row=10, column=2, sticky="w", padx=15, pady=10)
 
 
@@ -2869,6 +3192,7 @@ s_facelets.set(facelets_in_width)
 save_cam_num_btn = tk.Button(webcam_label, text="save cam settings", height=1, width=16, state="active",
                     command= save_webcam)
 save_cam_num_btn.configure(font=("Segoe UI", "12"))
+style_secondary_button(save_cam_num_btn)
 save_cam_num_btn.grid(row=10, column=8, sticky="w", padx=10, pady=10)
 
 
@@ -2886,6 +3210,43 @@ rb_scan_grid.grid(row=11, column=2, sticky="w", padx=6, pady=0)
 
 gui_scan_mode.set("auto")
 
+#### estimate facelets check button #### (moved here from next to the unrelated Get/Send-settings buttons -
+# both this and debug print-out are webcam-scanning options, so they belong grouped with the rest of this
+# section's camera/scan-mode settings, not floating unexplained at the top of the whole settings page)
+checkVar2 = tk.IntVar()
+c_estimate = tk.Checkbutton(webcam_label, text="estimate facelets \n(beta version)", variable=checkVar2,
+                            command=estimate_fclts_check, onvalue=1, offvalue=0)
+c_estimate.configure(font=("Segoe UI", "11"))
+c_estimate.grid(row=12, column=0, columnspan=2, sticky="w", padx=8, pady=10)
+add_tooltip(c_estimate, "If 1-2 facelets on a face aren't detected directly (glare, a scratch, a tilted "
+            "cube), predicts their position from the other facelets instead of waiting for a clean direct "
+            "detection. Faster/more forgiving scans, but an estimated facelet's color can occasionally be "
+            "read wrong since it wasn't actually detected - double-check results when this is on.")
+
+#### debug check button ####
+checkVar1 = tk.IntVar()
+c_debug = tk.Checkbutton(webcam_label, text="debug print-out\n(webcam)", variable=checkVar1,
+                         command=debug_check, onvalue=1, offvalue=0)
+c_debug.configure(font=("Segoe UI", "11"))
+c_debug.grid(row=12, column=2, columnspan=2, sticky="w", padx=8, pady=10)
+add_tooltip(c_debug, "Prints extra diagnostic detail to the terminal while scanning (measured colors, "
+            "contour counts, detection decisions). Doesn't change what the camera does - only useful when "
+            "troubleshooting why a scan misread something.")
+
+# the settings window's 4 bordered sections (Servos pulse width, Top cover servo, Cube holder servo, Webcam)
+# each auto-size to their own content's natural width, which differs section to section - left as-is they
+# visibly don't line up. Widen every section to match the widest one, and pin it there with grid_propagate
+# (a LabelFrame otherwise shrink-wraps back to its content regardless of an explicit width= setting).
+# grid_propagate(False) freezes BOTH dimensions, not just the one being overridden - height must also be
+# pinned explicitly (to each section's own natural height, not the shared max) or it collapses to whatever
+# Tk's un-configured default height is, clipping every widget inside below that line out of view entirely.
+root.update_idletasks()
+_settings_sections = [srv_pw_label, top_srv_label, b_srv_label, webcam_label]
+_settings_section_w = max(f.winfo_reqwidth() for f in _settings_sections)
+for _section in _settings_sections:
+    _section.configure(width=_settings_section_w, height=_section.winfo_reqheight())
+    _section.grid_propagate(False)
+
 ########################################################################################################################
 
 
@@ -2900,6 +3261,30 @@ gui_scan_mode.set("auto")
 create_facelet_rects(width)                       # calls the function to generate the cube sketch
 create_colorpick(width)                           # calls the function to generate the color-picking palette
 update_coms()                                     # calls the function to generate the cube sketch
+
+root.update_idletasks()   # forces geometry to actually be computed, so the buttons below have their real
+                           # on-screen size before _round_button() bakes an image at that exact size
+
+_round_button(b_read_solve, UI_ACCENT, UI_ACCENT_ACTIVE)
+for _btn in (b_empty, b_clean, b_random, b_refresh, b_connect, b_settings, b_reset):
+    _round_button(_btn, UI_BTN_SECONDARY_BG, UI_BTN_SECONDARY_ACTIVE)
+
+# settings-window buttons, previously only color-corrected (style_secondary_button) but left flat/square -
+# same rounding treatment as the main window, for one consistent button style across the whole app.
+# b_back/b_get_settings/b_send_settings sit directly on settingWindow, whose own bg is UI_PAGE_BG (not UI_BG,
+# unlike every other button here) - passing that explicitly matters, since _round_button() bakes the
+# surrounding color into the image itself; the default UI_BG would show as a visible mismatched halo.
+for _btn in (b_back, b_get_settings, b_send_settings):
+    _round_button(_btn, UI_BTN_SECONDARY_BG, UI_BTN_SECONDARY_ACTIVE, bg_hex=UI_PAGE_BG)
+
+# everything else here sits on a LabelFrame (or a plain Frame inside one), which - unlike settingWindow -
+# was never given an explicit bg override, so it inherits UI_BG same as the main window's panels: the
+# default bg_hex is correct as-is.
+for _btn in (pw_update_btn, flip_btn, open_btn, top_close_btn, CCW_btn, close_btn, CW_btn,
+             save_cam_num_btn, *_jog_btns):
+    _round_button(_btn, UI_BTN_SECONDARY_BG, UI_BTN_SECONDARY_ACTIVE)
+
+_add_hover_feedback(root)                         # adds mouse-over feedback to every button, now that they're all built
 root.protocol("WM_DELETE_WINDOW", close_window)   # the function close_function is called when the windows is closed
 root.mainloop()                                   # tkinter main loop
 
