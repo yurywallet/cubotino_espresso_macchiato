@@ -1750,7 +1750,12 @@ https://www.youtube.com/watch?v=x_5VbOOskw0 """
 def connect_check(args):
     """Function that activates the Connect button only when a serial port has been selected on the drop down menu."""
     
-    if "-" in clicked_com.get():         # case no serial port selected
+    # "-" is the placeholder inserted at coms[0] by update_coms() for "nothing selected yet" - this must be an
+    # exact match, not a substring check: a real port name can itself contain a hyphen (e.g. macOS names a
+    # CP2102/CH340 USB-serial adapter /dev/cu.usbserial-0001), and a substring check mistook that port for
+    # the placeholder, leaving Connect permanently disabled for exactly the port names this app most needs on
+    # macOS.
+    if clicked_com.get() == "-":         # case no serial port selected
         b_connect["state"] = "disable"   # Connect button is disabled
     else:                                # case a serial port selected
         b_connect["state"] = "active"    # Connect button is activated
