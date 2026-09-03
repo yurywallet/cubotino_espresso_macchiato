@@ -1808,8 +1808,8 @@ def connection():
     """Function to open / close the serial communication.
     When a serial is opened, a thread is initiated for the communication."""
     
-    global ser, serialData, gui_prog_bar, robot_working, cube_solving_string
-    
+    global ser, serialData, gui_prog_bar, robot_working, cube_solving_string, _poll_serial_after_id
+
     if "Disconnect" in b_connect["text"]:           # case the conection button shows Disconnect
         stop_robot()                                # robot is requested to stop
         robot_working=False                         # boolean tracking the robot working is set to False
@@ -1880,9 +1880,18 @@ def connection():
         b_settings["state"] = "active"               # settings button is activated
             
         t1 = threading.Thread(target=readSerial)     # a thread is associated to the readSerial function
-        t1.deamon = True                             # thread is set as deamon (runs in background with low priority)
+        # "deamon" (not a real Thread attribute - silently becomes a meaningless extra attribute, doing nothing)
+        # was a typo for "daemon" here, so t1 was never actually marked as a daemon thread and defaulted to
+        # non-daemon. A non-daemon thread makes CPython's own interpreter-shutdown sequence WAIT for it to
+        # finish before the process can exit - and this one is normally blocked inside a timeout=None
+        # ser.readline() with nothing to wake it. A background thread still alive (and touching interpreter
+        # state) while the interpreter is mid-shutdown is exactly the shape of the "python quit unexpectedly"
+        # crashes this app hit closing via more than one path (Cmd+Q's SIGTERM, and the plain red window-
+        # close button) - both ultimately reach the same PyEval_RestoreThread/fatal_error abort. Correctly
+        # marking it daemon lets the interpreter tear it down immediately on exit instead of waiting on it.
+        t1.daemon = True                             # thread is set as daemon (runs in background with low priority)
         t1.start()                                   # thread is started
-        root.after(50, _poll_serial_queue)           # starts draining what readSerial() queues - see its own docstring
+        _poll_serial_after_id = root.after(50, _poll_serial_queue)  # starts draining what readSerial() queues - see its docstring
 
 
 
@@ -1928,6 +1937,9 @@ def readSerial():
                 break                                         # while loop is interrupted
 
 
+_poll_serial_after_id = None   # the pending root.after() handle for _poll_serial_queue() - see close_window()
+
+
 def _poll_serial_queue():
     """Runs only on the main thread (started once via root.after() right after readSerial()'s thread is
     launched, and re-schedules itself the same way each time - the same self-rescheduling pattern already used
@@ -1935,6 +1947,8 @@ def _poll_serial_queue():
     queued since the last poll and hands each line to _process_serial_line(), all safely on the main thread.
     Stops rescheduling once serialData goes False (disconnect/close), matching readSerial()'s own loop
     condition, so the two don't outlive each other."""
+
+    global _poll_serial_after_id
 
     while True:
         try:
@@ -1944,7 +1958,9 @@ def _poll_serial_queue():
         _process_serial_line(data, received)
 
     if serialData:
-        root.after(50, _poll_serial_queue)
+        _poll_serial_after_id = root.after(50, _poll_serial_queue)
+    else:
+        _poll_serial_after_id = None
 
 
 def _process_serial_line(data, received):
@@ -2048,9 +2064,9 @@ def _process_serial_line(data, received):
 
 def close_window():
     """Function taking care to properly close things when the GUI is closed."""
-    
-    global root, serialData, ser
-    
+
+    global root, serialData, ser, _poll_serial_after_id
+
     try:
         if ser.isOpen():                           # case the serial port (at PC) is open
             print("closing COM")                   # feedback is printed to the terminal
@@ -2059,6 +2075,18 @@ def close_window():
     except:
         pass
     serialData = False                             # boolean tracking serial comm conditions is set False
+    # setting serialData False above only stops _poll_serial_queue() from scheduling its NEXT poll - it does
+    # nothing about one that's already pending in Tcl's timer queue from up to 50ms ago. Destroying the window
+    # while that timer is still due can fire it mid-teardown, which is exactly the shape of the crash this app
+    # hit earlier from a different trigger (Cmd+Q's SIGTERM path): a Python callback invoked while the
+    # interpreter is partway through tearing down aborts the whole process. Explicitly cancelling it removes
+    # that window entirely instead of relying on timing.
+    if _poll_serial_after_id is not None:
+        try:
+            root.after_cancel(_poll_serial_after_id)
+        except Exception:
+            pass
+        _poll_serial_after_id = None
     try:
         cam.quit_func()                             # close any active webcam window and camera
     except:
