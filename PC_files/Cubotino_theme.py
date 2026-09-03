@@ -20,6 +20,8 @@ a cv2-drawn canvas and a native Tk widget render literally the same font, so FON
 apply on the Tkinter side.
 """
 
+import sys                    # used to pick the platform's native UI font family
+
 # ---------------------------------------------------------------------------------------------------------
 # palette
 # ---------------------------------------------------------------------------------------------------------
@@ -39,6 +41,14 @@ BTN_SECONDARY_BG = '#DBE0E6'   # neutral/secondary button fill - kept clearly da
                                 # reads as a button rather than blending into the panel behind it
 BTN_SECONDARY_ACTIVE = '#C7CED6'
 
+GRID_GUIDE = '#A855F7'         # the fixed-grid alignment overlay drawn over the live camera frame. Deliberately
+                                # purple: it has to stay visible against every surface it can land on, and the
+                                # cube offers no safe neutral - a white guide disappears on the white face, a
+                                # black one disappears into the cube's black plastic body between facelets.
+                                # Purple is the one hue that is neither a cube color (white/red/green/yellow/
+                                # orange/blue) nor the body color, so it never camouflages against what it
+                                # is being aligned to.
+
 DIVIDER = '#E5E7EB'
 DISABLED_BG = '#F1F2F4'
 DISABLED_FG = '#C4C7CD'
@@ -46,7 +56,16 @@ DISABLED_FG = '#C4C7CD'
 # ---------------------------------------------------------------------------------------------------------
 # typography (Tkinter only - see module docstring)
 # ---------------------------------------------------------------------------------------------------------
-FONT_FAMILY = 'Segoe UI'
+# 'Segoe UI' is a Windows font. Tk does not report a missing family as an error, it silently substitutes a
+# generic default, so on macOS/Linux the whole UI quietly rendered in a font nothing else here was designed
+# around; the closest native equivalent is picked per platform instead.
+if sys.platform.startswith('win'):
+    FONT_FAMILY = 'Segoe UI'           # the Windows system UI font
+elif sys.platform == 'darwin':
+    FONT_FAMILY = 'Helvetica Neue'     # macOS: the SF system font is not exposed to Tk under a usable name
+else:
+    FONT_FAMILY = 'DejaVu Sans'        # the most commonly present sans family on Linux desktops
+
 FONT = (FONT_FAMILY, 11)
 FONT_BOLD = (FONT_FAMILY, 12, 'bold')
 FONT_TITLE = (FONT_FAMILY, 13, 'bold')

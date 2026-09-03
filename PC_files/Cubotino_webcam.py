@@ -33,6 +33,11 @@ import time
 import datetime as dt
 import json
 import os
+import sys
+
+CAMERA_WARMUP_S = 3.0    # seconds waited for a freshly opened camera to start returning frames
+CAMERA_RELEASE_SETTLE_S = 0.6   # seconds waited after releasing a capture, before reopening the same device
+CAMERA_REOPEN_ATTEMPTS = 3      # how many times the resolution-less reopen is retried before giving up
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cube_color_calibration.json')
 calibrated_colors = {}   # {'white': [(B,G,R), ...], ...} - a list of real sample points per color (one per
@@ -76,6 +81,8 @@ except:
     pass
 
 
+import twophase_tables                                # pins the Kociemba table cache to one folder
+
 # there are two import attempts for Kociemba solver
 try:                                                  # attempt
     import solver as sv                               # import Kociemba solver copied in robot folder
@@ -104,25 +111,98 @@ print('=========================================================================
 
 
 
+def camera_backend():
+    ''' Returns the cv2 capture backend to use on the running platform.
+    CAP_DSHOW (DirectShow) is Windows only: asking for it on macOS or Linux leaves the camera closed,
+    which surfaces later as "Cannot open camera".'''
+
+    if sys.platform.startswith('win'):
+        return cv2.CAP_DSHOW             # DirectShow, on Windows
+    elif sys.platform == 'darwin':
+        return cv2.CAP_AVFOUNDATION      # AVFoundation, the capture backend on macOS
+    else:
+        return cv2.CAP_V4L2              # Video4Linux2, the usual backend on Linux
+
+
+
+
+
+
+
+def screen_size():
+    ''' Returns the (width, height) of the screen in pixels, or None when it cannot be determined.
+    cv2 has no API for this, so it is asked of the OS: user32 on Windows, and elsewhere of the Tk root
+    Cubotino_GUI.py has already created (this module runs on the same, main, thread as that GUI).'''
+
+    if sys.platform.startswith('win'):
+        try:                                          # tentative
+            import ctypes                             # ctypes gives access to the Win32 API
+            user32 = ctypes.windll.user32             # user32 holds the screen metrics
+            return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        except Exception:                             # case of any issue reading the Windows metrics
+            pass                                      # the Tk based attempt below is used instead
+
+    try:                                              # tentative
+        import tkinter                                # tkinter is already loaded when called from the GUI
+        root = tkinter._default_root                  # the GUI's own root window, None when running standalone
+        if root is not None:                          # case a Tk root exists
+            return root.winfo_screenwidth(), root.winfo_screenheight()
+    except Exception:                                 # case of any issue querying Tk
+        pass                                          # the screen size stays unknown
+
+    return None                                       # the caller keeps cv2's own default window size
+
+
+
+
+
+
+
 def webcam(cam_num, cam_width=640, cam_height=360):
     ''' Set the camera and its resolution'''
     global camera
-    
+
     cam_num=int(cam_num)          # cam_num =0 is typically the one integrated on laptops
-    camera = cv2.VideoCapture(cam_num, cv2.CAP_DSHOW)         # camera object
-  
+    camera = cv2.VideoCapture(cam_num, camera_backend())      # camera object
+    if not camera.isOpened():                                 # case the platform backend did not open the camera
+        camera.release()                                      # the unusable capture object is released
+        camera = cv2.VideoCapture(cam_num)                    # retried, letting cv2 choose the backend itself
+
     camera_width_resolution = int(cam_width)                  # laptop camera, width resolution setting
     camera_height_resolution = int(cam_height)                # laptop camera, height resolution setting
-    
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width_resolution)    # camera width resolution is set  
+
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width_resolution)    # camera width resolution is set
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height_resolution)  # camera height resolution is set
-    
-    width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))         # return the camera reading width 
-    height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))       # return the camera reading higth 
-    
+
+    # the settings above are a request, not a guarantee: the default 640x360 is a 16:9 size plenty of cameras
+    # do not offer (it is not an AVFoundation format on macOS), and a camera asked for a size it does not have
+    # can end up delivering no frames at all. When that happens the camera is reopened as it comes, and
+    # whatever resolution it does provide is read back below and used from there on.
+    if not camera_delivers_frames(camera):                    # case the camera returns no frame at that resolution
+        print(f'No frames at {camera_width_resolution}x{camera_height_resolution}, '
+              'the camera default resolution is used instead')
+        camera.release()                                      # the camera is released before being reopened
+        # release() does not hand the device back instantly: AVFoundation (macOS) tears its capture session
+        # down asynchronously, so reopening the same camera in the same breath hands back a capture that
+        # opens yet never delivers a frame - which is the very failure this fallback exists to escape, so it
+        # failed exactly when it was needed and the app reported "open but returns no frames" either way.
+        # The device is given a moment to actually come free, and the reopen is retried, before giving up.
+        for attempt in range(CAMERA_REOPEN_ATTEMPTS):         # iteration over the reopen attempts
+            time.sleep(CAMERA_RELEASE_SETTLE_S)               # the device is given time to be released
+            camera = cv2.VideoCapture(cam_num, camera_backend())  # camera object, with no resolution requested
+            if camera_delivers_frames(camera):                # case the reopened camera delivers frames
+                break                                         # this capture object is the one to keep
+            if attempt < CAMERA_REOPEN_ATTEMPTS - 1:          # case there are further attempts left
+                camera.release()                              # the unusable capture object is released
+            # the last attempt's capture is deliberately left open: camera_opened_check() and read_camera()
+            # then report their own specific diagnosis, rather than this returning an already-released object
+            # whose every property reads back as 0
+
+    width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))         # return the camera reading width
+    height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))       # return the camera reading higth
+
     if side==0 and debug:
         print(f'Camera resolution: {width} x {height}\n')
-    time.sleep(0.5)
 #         clear_terminal()
     return camera, width, height
 
@@ -132,16 +212,46 @@ def webcam(cam_num, cam_width=640, cam_height=360):
 
 
 
-def read_camera():
-    ''' Returns the camera reading, and dimensions '''
+def camera_delivers_frames(cap, timeout=CAMERA_WARMUP_S):
+    ''' True when the capture object starts returning frames within the timeout.
+    An opened camera is not necessarily a working one: isOpened() only reports that the device was claimed,
+    while the frames can still fail to arrive (a camera that needs a moment to settle, a resolution the
+    device does not actually offer, or on macOS a Continuity Camera whose iPhone is not around).'''
 
-    ret, frame = camera.read()                     # ret is the boolean if the image array is available, and the image
-    if ret==False:
-        print('Webcam frame not available: ret variable == False')
-    else:
-        frame = cv2.flip(frame, 1)                 # horizontal flip, so the feed behaves like a mirror instead of a security cam
-        frame, w, h = frame_cropping(frame, width, height)     # frame is cropped in order to limit the image area to analyze
-        return frame, w, h
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cap.read()[0]:                          # case a frame was returned
+            return True                            # the camera is delivering
+        time.sleep(0.1)                            # the device is given a moment before the next attempt
+    return False                                   # no frame within the timeout
+
+
+
+
+
+
+
+def read_camera(attempts=3):
+    ''' Returns the camera reading, and dimensions.
+    A single failed read is not necessarily fatal (frames can be dropped while the device settles), so it is
+    retried; a lasting failure raises instead of returning None, as all the callers unpack the returned tuple
+    and a None only surfaced later, as an unrelated "cannot unpack non-iterable NoneType object" error.'''
+
+    for attempt in range(attempts):                # iteration over the read attempts
+        ret, frame = camera.read()                 # ret is the boolean if the image array is available, and the image
+        if ret:                                    # case the frame is available
+            frame = cv2.flip(frame, 1)             # horizontal flip, so the feed behaves like a mirror instead of a security cam
+            frame, w, h = frame_cropping(frame, width, height)     # frame is cropped in order to limit the image area to analyze
+            return frame, w, h
+        if attempt < attempts - 1:                 # case there are further attempts left
+            time.sleep(0.1)                        # the device is given a moment to recover
+
+    print('Webcam frame not available: ret variable == False')
+    hint = 'try another webcam number on the settings page'
+    if sys.platform == 'darwin':                   # macOS lists cameras that cannot actually deliver frames
+        hint += (', as macOS also lists cameras that deliver nothing, such as a Continuity Camera '
+                 'while the iPhone is away')
+    raise RuntimeError(f'the camera is open but returns no frames ({hint})')
 
 
 
@@ -684,7 +794,7 @@ def detect_in_fixed_zone(frame, w, h, debounce=None):
     ''' Draws a fixed target zone in the frame for the user to hold a cube face against, and looks for the 9
     facelet squares (see find_cube_facelet_squares()) ONLY within that zone - restricting both detection and
     color sampling to a small, known region, rather than hunting the whole frame where background clutter can
-    get mistaken for the cube. The zone's border is white by default and turns GREEN once a full 3x3 grid has
+    get mistaken for the cube. The zone's border is purple by default and turns GREEN once a full 3x3 grid has
     been confirmed inside it for several consecutive frames (see Debouncer) - giving stable visual feedback
     that the cube is positioned correctly, instead of the border (and calibration's "Sample" button, which
     shares this same signal) flickering on/off with every tiny hand tremor. Used by both the normal scan
@@ -719,7 +829,9 @@ def detect_in_fixed_zone(frame, w, h, debounce=None):
     active_debounce = debounce if debounce is not None else _default_zone_debounce
     stable_found = active_debounce.update(bool(rects))
 
-    zone_color = (0, 255, 0) if stable_found else (255, 255, 255)   # green once confirmed (and held) in the zone
+    zone_color = (0, 255, 0) if stable_found else GRID_GUIDE   # green once confirmed; purple guide otherwise -
+                                                                 # not white, so it stays visible on the white
+                                                                 # face too (see GRID_GUIDE's note in Cubotino_theme.py)
     cv2.rectangle(frame, (zx0, zy0), (zx0+zone_w, zy0+zone_w), zone_color, 3)
     for (x, y, rw, rh) in rects:
         cv2.rectangle(frame, (x, y), (x+rw, y+rh), (255, 0, 0), 1)   # each detected facelet, thin blue square
@@ -839,7 +951,7 @@ def read_facelets_fixed_grid(det_face_time, delay, proceed):
         for col in range(3):
             x = gx0 + col*grid_edge
             y = gy0 + row*grid_edge
-            cv2.rectangle(frame, (x, y), (x+grid_edge, y+grid_edge), (255, 255, 255), 2)
+            cv2.rectangle(frame, (x, y), (x+grid_edge, y+grid_edge), GRID_GUIDE, 2)
 
     if wait_time > 0 and not proceed:       # not yet time to capture: grid is drawn, nothing returned yet
         return [], None
@@ -2095,6 +2207,7 @@ DANGER_ACTIVE = theme.hex_to_bgr(theme.DANGER_ACTIVE)
 BTN_SECONDARY_BG = theme.hex_to_bgr(theme.BTN_SECONDARY_BG)
 BTN_SECONDARY_ACTIVE = theme.hex_to_bgr(theme.BTN_SECONDARY_ACTIVE)
 DIVIDER = theme.hex_to_bgr(theme.DIVIDER)
+GRID_GUIDE = theme.hex_to_bgr(theme.GRID_GUIDE)  # purple alignment grid - see the token's note in Cubotino_theme.py
 BTN_RADIUS = theme.BTN_RADIUS    # corner radius for the flat, rounded-rect modern button look
 INSTRUCTION_BLOCK_H = 104   # fixed height reserved for the instructions block: 2 items x up to 2 wrapped lines
                             # each (2*22) + the 8px per-item gap, regardless of how much a given state's text
@@ -3142,7 +3255,18 @@ def review_scan():
     global frame, w, h
 
     net_edge = 40   # same size used throughout scanning, so the layout doesn't visibly jump when review starts
-    review_buttons = [('accept', 'Accept', 'primary'), ('quit', 'Close', 'danger')]
+    # 'Accept results' rather than a bare 'Accept': at this point the scan itself is over and what is being
+    # accepted is the 6 captured faces shown in the map, which then become the cube status the main window
+    # solves from - 'Accept' alone read as if it were confirming just the last face, like the per-face gate.
+    # Button count (3) and top_button presence must match the main scan screens' own shape (scan_buttons() in
+    # cubeAF(): 3 buttons, plus calibrate_top_button) - estimate_sidebar_height() sizes the window from exactly
+    # those two things, not from what the buttons actually do (same reasoning already applied to
+    # calibrate_cube_colors() below, for the same symptom: a mismatched shape here made the 'cube' window
+    # visibly resize every time a scan finished and this review screen opened). The 3rd button and the
+    # top_button are real widgets but disabled/inert - only their reserved layout space matters.
+    review_buttons = [('accept', 'Accept results', 'primary'), ('quit', 'Close', 'danger'),
+                       ('_reserved', '', 'secondary', False)]
+    review_top_button = ('calibrate', 'Calibrate colors', 'secondary', False)
     while True:
         frame, w, h = read_camera()
 
@@ -3154,7 +3278,7 @@ def review_scan():
             face_colors[letter] = classify_bgr_to_6(avg)[1]
 
         canvas_h = max(h, estimate_sidebar_height(['Click a face below to rescan it,', 'or Accept to continue.'],
-                                                    review_buttons, None, net_edge))
+                                                    review_buttons, None, net_edge, review_top_button))
         if canvas_h > h:
             pad = np.full((canvas_h-h, frame.shape[1], 3), (60, 60, 60), dtype=np.uint8)
             padded_frame = np.vstack([frame, pad])
@@ -3163,7 +3287,8 @@ def review_scan():
         sidebar_img, rects = render_sidebar(canvas_h, font, 'Scan complete',
                                              ['Click a face below to rescan it,', 'or Accept to continue.'],
                                              review_buttons, compute_face_progress(), None, None,
-                                             face_colors, clickable_net=True, net_edge=net_edge)
+                                             face_colors, clickable_net=True, net_edge=net_edge,
+                                             top_button=review_top_button)
         compose_and_show(padded_frame, sidebar_img, rects)
 
         key, action = poll_action(150)
@@ -3201,7 +3326,15 @@ def cubeAF():
     
     if not camera_opened_check():       # case the camera is not responsive
         print('\nCannot open camera')   # feedback is printed
-        quit_func()                     # script is closed
+        quit_func()                     # camera and cv2 windows are closed
+        # quit_func() closes the camera but does not stop the script: without raising here the code carried on to
+        # read_camera(), that returns None, and the caller crashed on unpacking it ("cannot unpack non-iterable
+        # NoneType object"), which is what reached the GUI instead of the real cause
+        hint = 'check the webcam number on the settings page'
+        if sys.platform == 'darwin':     # macOS gates the camera per application, and denies it silently
+            hint += (', and allow the camera for the application running python (terminal, or IDE) at '
+                     'System Settings > Privacy & Security > Camera')
+        raise RuntimeError(f'cannot open camera ({hint})')
     
     frame, w, h = read_camera()         # video stream and frame dimensions
     if fixWindPos:                      # case the fixWindPos variable is set true on __main__
@@ -3211,10 +3344,12 @@ def cubeAF():
         cv2.namedWindow('cube', cv2.WINDOW_NORMAL)
         cv2.setMouseCallback('cube', on_cube_mouse)   # sidebar buttons become clickable
         cv2.moveWindow('cube', 0,0)     # move the cube window to (0,0)
-        try:                             # best-effort: cap the initial window size to the actual screen, so it
-            import ctypes                # doesn't open larger than the display with nothing yet telling the user
-            user32 = ctypes.windll.user32     # it's now draggable-resizable (Windows only; harmless no-op elsewhere)
-            screen_w, screen_h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        screen = screen_size()           # best-effort: cap the initial window size to the actual screen, so it
+                                         # doesn't open larger than the display with nothing yet telling the user
+                                         # it's now draggable-resizable. None when the size cannot be read
+        try:
+            screen_h = screen[1]         # screen height in pixels
+
             # cv2's WINDOW_NORMAL stretches whatever's shown to fill the window rect exactly (no letterboxing),
             # so this must match the ACTUAL composed canvas size show_cube_frame() will display - not the raw
             # camera height - or the image gets non-uniformly squashed/stretched to fit a mismatched window.

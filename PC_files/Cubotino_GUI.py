@@ -88,11 +88,14 @@ print()
 
 # ################################## Imports  ##########################################################################
 # custom libraries
+import twophase_tables                  # pins the Kociemba table cache to one folder (before any solver import)
 import Cubotino_webcam as cam           # recognize cube status via a webcam (by Andrea Favero)
 import Cubotino_moves as cm             # translate a cube solution into CUBOTino robot moves (by Andrea Favero)
 
 
 import sys                                            # library import to check if another lybrary is already imported
+import signal                                         # used to safely intercept SIGTERM/SIGINT on macOS - see the
+                                                       # note by its use, near root.mainloop()
 if 'solver' in sys.modules or 'cm' in globals():      # case the library 'solver'is already imported
     solver_already_imported = True                    # booleand variable is set true
 else:                                                 # case the library 'solver'is not already imported
@@ -500,8 +503,15 @@ def create_facelet_rects(a):
             for col in range(3):                         # iteration over three columns, of cube facelests per face
                 x = 20 + offset[f][0] * 3 * a + col * a + offset[f][0]*gap  # top left x coordinate to draw a rectangule
                 
-                # the list of graphichal facelets (global variable) is populated, and initially filled in grey color
-                facelet_id[f][row][col] = gui_canvas.create_rectangle(x, y, x + a, y + a, fill="grey65", width=2)
+                # the list of graphichal facelets (global variable) is populated, and initially filled in grey color.
+                # outline is set explicitly (not left at Tk's default): an unset outline resolves to the named
+                # color "systemTextColor", which macOS itself flips per the user's system appearance - white
+                # in Dark Mode. That made every facelet's border render white regardless of the app's own
+                # (light-only) theme, which is invisible on the white face and a faint mismatch everywhere
+                # else - reported as "the spacing between facelets" not showing up. UI_TEXT_PRIMARY is a fixed
+                # hex from Cubotino_theme.py, so the grid now looks the same regardless of system appearance.
+                facelet_id[f][row][col] = gui_canvas.create_rectangle(x, y, x + a, y + a, fill="grey65", width=2,
+                                                                       outline=UI_TEXT_PRIMARY)
     
     for f in range(6):  # iteration over the 6 faces
         gui_canvas.itemconfig(facelet_id[f][1][1], fill=cols[f]) # centers face facelets are colored as per cols list
@@ -523,7 +533,7 @@ def face_letters(a):
         x = 20 + offset[f][0] * 3 * a + a + offset[f][0]*gap   # x coordinate for text placement
         
         # each of the URFDLB letters are placed on the proper cuvbe face
-        faceletter_id[f]=gui_canvas.create_text(x + width // 2, y + width // 2, font=("Segoe UI", 18), text=t[f], fill="black")
+        faceletter_id[f]=gui_canvas.create_text(x + width // 2, y + width // 2, font=(UI_FONT_FAMILY, 18), text=t[f], fill="black")
 
 
 
@@ -536,7 +546,7 @@ def create_colorpick(a):
     global curcol, cols
     
     cp = tk.Label(gui_canvas, text="color picking")      # gui text label informing the color picking concept
-    cp.config(font=("Segoe UI", 18))                        # gui text font is set
+    cp.config(font=(UI_FONT_FAMILY, 18))                        # gui text font is set
 
     # gui text label for color picking info is placed on the canvas, just below the F/R/B row's bottom edge
     # (20 + 6*width + gap, per create_facelet_rects()'s own y formula for that row). The circles' start row is
@@ -1455,6 +1465,14 @@ def cube_read_solve():
                     cube_defstr = cube_defstr+"\n"            # cube status string in completed by '\n'
                     redraw(cube_defstr)                       # cube sketch on screen is updated to cube status string
                     draw_cubotino_center_colors()             # draw the cube center facelets with related colors
+                    # the scan's result now LIVES in the on-screen sketch, so that is what the cube status
+                    # should be read from next: leaving the radiobutton on "webcam" means the obvious next
+                    # press of Read & solve throws the just-accepted scan away and reopens the camera to scan
+                    # all six faces again. Switching it to "screen sketch" makes that press re-solve from the
+                    # scan instead - and makes it visible which source the displayed sketch actually came from.
+                    # Only on a valid scan: a failed/aborted one leaves an empty sketch, and switching modes
+                    # there would silently strand the user in a mode with nothing to solve.
+                    gui_read_var.set("screen sketch")         # radiobutton follows the scan into the sketch
             except Exception as ex:
                 print(f"ERROR: webcam cube reading failed: {ex}")   # feedback is printed to the terminal, regardless of debug
                 show_text(f"\n Cube status not defined: {ex}\n")    # error is shown on the GUI text window, regardless of debug
@@ -1757,7 +1775,7 @@ def update_coms():
     clicked_com = tk.StringVar()                    # string variable used by tkinter for the selection
     clicked_com.set(coms[0])                        # activates first drop down menu position (not a serial port)
     b_drop_COM = tk.OptionMenu(gui_robot_label, clicked_com, *coms, command=connect_check) # populated drop down menu
-    b_drop_COM.config(width=7, font=("Segoe UI", "10"))        # drop down menu settings
+    b_drop_COM.config(width=7, font=(UI_FONT_FAMILY, "10"))        # drop down menu settings
     # sticky="ew" (not "w"): an OptionMenu's own natural width doesn't line up with a same-"width=" Button's
     # (different widget types, different internal padding/border), so anchoring it to one side by width alone
     # kept landing off by a few pixels either way. Stretching it to fill the full column - the same column
@@ -2382,10 +2400,60 @@ try:
 except:
     pass
 
+def icon_photo(ico_file):
+    """ Returns a tk.PhotoImage of the application icon, or None when it cannot be built.
+    root.iconbitmap() takes a .ico file on Windows only; on macOS and Linux Tk wants a PhotoImage instead.
+    The .ico holds its largest entry as an embedded PNG, a format Tk does read, so that entry is taken
+    straight out of the file rather than keeping a second copy of the same icon around."""
+
+    import base64, struct                              # only needed here, to unpack the .ico and feed Tk
+
+    try:                                               # tentative
+        with open(ico_file, 'rb') as f:                # the icon file is opened in binary read mode
+            blob = f.read()                            # whole file, it is a small one
+        count = struct.unpack('<H', blob[4:6])[0]      # amount of images held by the .ico file
+        best = None                                    # largest PNG encoded entry found so far
+        for i in range(count):                         # iteration over the icon directory entries
+            entry = struct.unpack('<BBBBHHII', blob[6 + 16*i:22 + 16*i])   # one 16 bytes icon directory entry
+            w, h, size, offset = entry[0], entry[1], entry[6], entry[7]    # width, height, data size, data offset
+            w, h = w or 256, h or 256                  # a zero in the .ico directory means 256 pixels
+            png = blob[offset:offset + size]           # the entry image data
+            if png[:8] == b'\x89PNG\r\n\x1a\n' and (best is None or w*h > best[0]):  # case a PNG larger than the previous
+                best = (w*h, png)                      # entry is kept as the best candidate
+        if best is None:                               # case no entry is PNG encoded (older .ico files)
+            return None                                # no icon can be given to Tk
+        return tk.PhotoImage(data=base64.b64encode(best[1]))   # Tk takes the PNG as a base64 string
+    except Exception:                                  # case of any issue while parsing the icon file
+        return None                                    # the app simply keeps the default icon
+
+
 root = tk.Tk()                                     # initialize tkinter as root
+if sys.platform == 'darwin':
+    # This app's whole visual design (Cubotino_theme.py, every color chosen throughout the GUI) targets a
+    # fixed light look and was never built with a dark counterpart. On this Tk 9 Aqua build, any color left
+    # unset here falls back to a macOS "semantic" color (systemTextColor, systemWindowBackgroundColor, etc.)
+    # that Tk now resolves against the CURRENT system appearance rather than a fixed value - so in system
+    # Dark Mode those defaults silently flip to their dark-mode values (systemTextColor -> white,
+    # systemWindowBackgroundColor -> near-black), clashing with the app's own hard-coded light palette.
+    # Concretely reported as: a facelet grid whose (unset) outline came out white - invisible on the white
+    # face - and unstyled panels rendering near-black instead of blending into the rest of the light UI.
+    # Forcing this window's own appearance to 'aqua' (light) makes every such default resolve consistently
+    # to its light-mode value regardless of the user's system-wide Dark Mode setting - matching what the
+    # theme was actually designed for, without having to hunt down and hard-code every individual widget
+    # that happens to lean on one of these Tk defaults.
+    try:
+        root.tk.call('::tk::unsupported::MacWindowStyle', 'appearance', root, 'aqua')
+    except tk.TclError:
+        pass   # older Tk without this call: falls back to tracking system appearance, as before
 root.title("CUBOTino: Rubik's cube solver robot")  # name is assigned to GUI root
+app_icon = None                                    # module level reference, Tk does not keep images alive itself
 try:
-    root.iconbitmap("Rubiks-cube.ico")             # custom icon is assigned to GUI root
+    if sys.platform.startswith('win'):             # case the app runs on Windows
+        root.iconbitmap("Rubiks-cube.ico")         # custom icon is assigned to GUI root
+    else:                                          # case the app runs on macOS or Linux
+        app_icon = icon_photo("Rubiks-cube.ico")   # the PNG entry embedded in the .ico is extracted
+        if app_icon is not None:                   # case the icon could be built
+            root.iconphoto(True, app_icon)         # custom icon is assigned to GUI root
 except:
     pass
 
@@ -2456,8 +2524,115 @@ root.option_add('*Button.takeFocus', 0)
 root.option_add('*Font', UI_FONT)
 
 
+class FlatButton(tk.Label):
+    """A push button that renders identically on Windows, macOS and Linux.
+
+    A real tk.Button cannot do that. On macOS (Aqua) Tk always draws the platform's own bezel around the
+    widget and paints its background itself, ignoring -background/-relief/-borderwidth entirely: with the
+    exact same options, a Button measures 164x32 where a Label measures 136x28 - 28x4 pixels of native chrome
+    that no combination of relief='flat', bd=0 and highlightthickness=0 removes. _round_button() below sizes
+    its baked rounded-rect image to fit INSIDE that chrome, so on macOS every button rendered as a colored
+    pill recessed inside a native white frame - the "buttons look like they are under the surface" report -
+    while the identical code on Windows produced the intended flat pill. A tk.Label has no such chrome on any
+    platform, honours -background everywhere, and supports every other option this app sets on its buttons
+    (activebackground/activeforeground/disabledforeground/state/relief/image/compound/padx/pady). Only
+    -command is missing, which is what this wrapper adds.
+
+    Two behaviours are reproduced deliberately rather than inherited:
+     - `state="active"` is used throughout this file as a synonym for "enabled" (see gui_buttons_state and the
+       many b_x["state"] = "active" assignments). On a Button that is a transient hover appearance; on a Label
+       it is a permanent one, which would leave those buttons stuck in their hover color at rest. It is
+       normalised to "normal" on the way in - at construction AND on later assignment, since the state is
+       reassigned at runtime from a variable (e.g. b_read_solve["state"] = status).
+     - a Label has no pressed appearance, so press/release is drawn here; without it a click gives no feedback
+       at all on the buttons _round_button() hasn't processed.
+    """
+
+    def __init__(self, master=None, command=None, **kw):
+        kw.setdefault('bg', UI_BTN_SECONDARY_BG)
+        kw.setdefault('fg', UI_TEXT_PRIMARY)
+        kw.setdefault('activebackground', UI_BTN_SECONDARY_ACTIVE)
+        kw.setdefault('activeforeground', UI_TEXT_PRIMARY)
+        kw.setdefault('disabledforeground', UI_TEXT_SECONDARY)
+        kw.setdefault('font', UI_FONT)
+        kw.setdefault('relief', 'flat')
+        kw.setdefault('bd', 0)
+        kw.setdefault('highlightthickness', 0)
+        kw.setdefault('padx', 14)
+        kw.setdefault('pady', 6)
+        kw.setdefault('cursor', 'hand2')
+        kw.setdefault('takefocus', 0)
+        if 'state' in kw:
+            kw['state'] = self._normalise_state(kw['state'])
+        tk.Label.__init__(self, master, **kw)
+        self._command = command
+        self._pressed = False
+        self.bind('<Button-1>', self._on_press, add='+')
+        self.bind('<ButtonRelease-1>', self._on_release, add='+')
+
+    @staticmethod
+    def _normalise_state(value):
+        # "active" means "enabled" at this app's call sites, not "draw me in my hover color forever"
+        return 'normal' if str(value) == 'active' else value
+
+    def _enabled(self):
+        return str(self['state']) != 'disabled'
+
+    def _on_press(self, event=None):
+        if not self._enabled():
+            return
+        self._pressed = True
+        # the rounded buttons already own a hover image; reuse it as the pressed look rather than fighting it
+        if hasattr(self, '_rounded_hover_img'):
+            self.configure(image=self._rounded_hover_img)
+        else:
+            self.configure(bg=self['activebackground'])
+
+    def _on_release(self, event=None):
+        if not self._pressed:
+            return
+        self._pressed = False
+        if hasattr(self, '_rounded_normal_img'):
+            self.configure(image=self._rounded_normal_img)
+        else:
+            # b_robot's resting color is reassigned at runtime, so restore from the same _true_bg that
+            # _add_hover_feedback() maintains rather than from a stale snapshot taken at press time
+            resting = getattr(self, '_true_bg', None)
+            if resting is not None:
+                self.configure(bg=resting)
+        if not self._enabled() or self._command is None:
+            return
+        # a press that is dragged off the button before release should not fire it, the same as a real button
+        x, y = event.x, event.y
+        if 0 <= x < self.winfo_width() and 0 <= y < self.winfo_height():
+            self._command()
+
+    def configure(self, cnf=None, **kw):
+        if 'command' in kw:
+            self._command = kw.pop('command')
+        if 'state' in kw:
+            kw['state'] = self._normalise_state(kw['state'])
+        if isinstance(cnf, dict) and 'state' in cnf:
+            cnf = dict(cnf, state=self._normalise_state(cnf['state']))
+        return tk.Label.configure(self, cnf, **kw)
+
+    config = configure
+
+    def __setitem__(self, key, value):
+        if key == 'command':
+            self._command = value
+            return
+        if key == 'state':
+            value = self._normalise_state(value)
+        tk.Label.__setitem__(self, key, value)
+
+    def invoke(self):
+        if self._enabled() and self._command is not None:
+            return self._command()
+
+
 def style_secondary_button(btn):
-    """Explicitly applies the secondary-button theme to a tk.Button. Some buttons only ever got their color
+    """Explicitly applies the secondary-button theme to a FlatButton. Some buttons only ever got their color
     from the option database above and, on Windows, would render with a broken near-black background once
     their state was toggled to 'disable' and back at runtime (buttons that are always left alone, or whose
     color was set explicitly at creation, weren't affected) - configuring every color directly on the widget
@@ -2547,7 +2722,7 @@ def _rounded_button_photo(w, h, radius, fill_hex, bg_hex):
 
 
 def _round_button(btn, fill_hex, hover_hex, bg_hex=None, radius=10):
-    """Gives a tk.Button real rounded corners via a baked rounded-rect image (Tk buttons have no native corner-
+    """Gives a FlatButton real rounded corners via a baked rounded-rect image (Tk has no native corner-
     radius option). Only suitable for buttons whose fill color is fixed at setup time - b_robot is
     deliberately left a plain flat rectangle, since its background is reassigned to many different colors
     throughout the code (gui_robot_btn_update() etc.) to signal robot state; each of those call sites would
@@ -2558,7 +2733,7 @@ def _round_button(btn, fill_hex, hover_hex, bg_hex=None, radius=10):
 
     bg_hex = bg_hex or UI_BG
     w, h = btn.winfo_reqwidth(), btn.winfo_reqheight()
-    # critical: a tk.Button's width/height options mean "characters of text" with no image, but silently
+    # critical: width/height mean "characters of text" with no image attached, but silently
     # switch to meaning PIXELS once an image is attached - the button was originally created with e.g.
     # width=12 meaning "12 characters" (~100px); left unset at configure time, attaching the image
     # reinterpreted that same "12" as 12 PIXELS, crushing every rounded button down to a sliver with clipped
@@ -2594,7 +2769,7 @@ def _round_button(btn, fill_hex, hover_hex, bg_hex=None, radius=10):
     # dashed keyboard-focus rectangle peeking past the rounded corners) after being clicked means whatever
     # gave it focus wasn't actually blocked by the option-database rule alone.
     btn.configure(takefocus=0)
-    # belt-and-suspenders: a plain tk.Button can still be given focus by a mouse click even with takefocus=0
+    # belt-and-suspenders: a widget can still be given focus by a mouse click even with takefocus=0
     # (that option only excludes it from Tab-key traversal) - if it ever does gain focus, immediately hand it
     # back to the button's own parent, before Tk's next redraw has a chance to paint the dashed focus rectangle.
     btn.bind('<FocusIn>', lambda event, b=btn: b.master.focus_set())
@@ -2603,14 +2778,14 @@ def _round_button(btn, fill_hex, hover_hex, bg_hex=None, radius=10):
 
 
 def _add_hover_feedback(widget):
-    """Recursively binds every tk.Button under `widget` so it visibly reacts on mouse-over: swaps to its
+    """Recursively binds every FlatButton under `widget` so it visibly reacts on mouse-over: swaps to its
     rounded hover-image variant for buttons _round_button() has processed, or darkens its flat bg slightly for
     any other (still-rectangular) button. Flat buttons with no bevel give no visual hint of interactivity
     until actually pressed - this is the hand-cursor's companion cue (see '*Button.Cursor' above), added once
     after the whole GUI tree is built."""
 
     for child in widget.winfo_children():
-        if isinstance(child, tk.Button):
+        if isinstance(child, FlatButton):
             if hasattr(child, '_rounded_normal_img'):
                 def on_enter(event, b=child):
                     if str(b['state']) != 'disabled':
@@ -2724,9 +2899,14 @@ y = int((hs/2) - (min_height/2))          # top left y coordinate to center on t
 root.geometry(f'{min_width}x{min_height}+{x}+{y}') # setting the GUI dimension (screen-capped), and its centering
 root.resizable(True, True)                         # allowing the root windows to be resizeale
 try:
-    root.state('zoomed')                           # start with a larger window on Windows, so the webcam scan area is easier to read
+    root.state('zoomed')                           # start with a larger window, so the webcam scan area is easier to read
 except:
-    pass
+    # the 'zoomed' state is a Windows (and recent macOS Tk) feature; where it is rejected the window is
+    # simply grown to the screen, so the app does not open small on the platforms missing it
+    try:
+        root.geometry(f'{ws}x{hs - 80}+0+0')       # 80 pixels are left for the menu/task bar
+    except:
+        pass
 root.update_idletasks()
 
 root.rowconfigure(0, weight=1)                 # root is set to have 1 row of  weight=1
@@ -2776,7 +2956,7 @@ gui_text_window.place(x=20+6*width+10+2*gap, y=20, height=3*width-10, width=6*wi
 
 
 # cube status and solve buttons
-cube_status_label = tk.LabelFrame(gui_f2, text="Cube status", labelanchor="nw", font=("Segoe UI", "12"))
+cube_status_label = tk.LabelFrame(gui_f2, text="Cube status", labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 cube_status_label.grid(column=0, row=0, columnspan=2, sticky="w", padx=10, pady=10)
 # NOTE: rounded-panel wrapping (_wrap_in_rounded_panel) was tried here and reverted - it passed every
 # isolated/integration test written for it, but broke this panel's actual visibility in the real app (went
@@ -2789,29 +2969,29 @@ read_modes=["webcam","screen sketch"]  #,"robot color sens"]
 gui_read_var = tk.StringVar()
 for i, read_mode in enumerate(read_modes):
     rb=tk.Radiobutton(cube_status_label, text=read_mode, variable=gui_read_var, value=read_mode)
-    rb.configure(font=("Segoe UI", "10"))
+    rb.configure(font=(UI_FONT_FAMILY, "10"))
     rb.grid(column=0, row=i, sticky="w", padx=10, pady=0)
 gui_read_var.set("webcam")
 
 
 # buttons for the cube status part
-b_read_solve = tk.Button(cube_status_label, text="Read &\nsolve", height=3, width=11, command=cube_read_solve)
+b_read_solve = FlatButton(cube_status_label, text="Read &\nsolve", height=3, width=11, command=cube_read_solve)
 b_read_solve.configure(font=UI_FONT_BOLD, bg=UI_ACCENT, fg='white',
                         activebackground=UI_ACCENT_ACTIVE, activeforeground='white')  # primary action, accent-colored
 b_read_solve.grid(column=1, row=0, sticky="w", rowspan=3, padx=10, pady=5)
 
-b_empty = tk.Button(cube_status_label, text="Empty", height=1, width=12, command=empty)
-b_empty.configure(font=("Segoe UI", "11"))
+b_empty = FlatButton(cube_status_label, text="Empty", height=1, width=12, command=empty)
+b_empty.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_empty)
 b_empty.grid(column=0, row=3, sticky="w", padx=10, pady=5)
 
-b_clean = tk.Button(cube_status_label, text="Solved", height=1, width=11, command=clean)
-b_clean.configure(font=("Segoe UI", "11"))
+b_clean = FlatButton(cube_status_label, text="Solved", height=1, width=11, command=clean)
+b_clean.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_clean)
 b_clean.grid(column=1, row=3, sticky="w",padx=10, pady=5)
 
-b_random = tk.Button(cube_status_label,text="Random", height=1, width=12, command=random)
-b_random.configure(font=("Segoe UI", "11"))
+b_random = FlatButton(cube_status_label,text="Random", height=1, width=12, command=random)
+b_random.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_random)
 b_random.grid(column=0, row=4, padx=10, pady=10, sticky="w")
 
@@ -2830,7 +3010,7 @@ def update_read_solve_label():
 
 gui_scramble_var = tk.BooleanVar()
 cb_scramble=tk.Checkbutton(cube_status_label, text="scramble", variable=gui_scramble_var, command=update_read_solve_label)
-cb_scramble.configure(font=("Segoe UI", "10"))
+cb_scramble.configure(font=(UI_FONT_FAMILY, "10"))
 cb_scramble.grid(column=1, row=4, sticky="ew", padx=5, pady=5)
 gui_scramble_var.set(0)
 
@@ -2842,30 +3022,30 @@ update_read_solve_label()   # sets the correct initial label now that gui_read_v
 
 
 # robot related buttons
-gui_robot_label = tk.LabelFrame(gui_f2, text="Robot", labelanchor="nw", font=("Segoe UI", "12"))
+gui_robot_label = tk.LabelFrame(gui_f2, text="Robot", labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 gui_robot_label.grid(column=0, row=6, rowspan=11, columnspan=2, sticky="n", padx=10, pady=10)
 # NOTE: see the matching comment above cube_status_label's grid() - rounded-panel wrapping reverted here too.
 
-b_robot = tk.Button(gui_robot_label, text="Robot", command=robot_solver, height=6, width=11)
-b_robot.configure(font=("Segoe UI", "12"), relief="sunken", state="disable")
+b_robot = FlatButton(gui_robot_label, text="Robot", command=robot_solver, height=6, width=11)
+b_robot.configure(font=(UI_FONT_FAMILY, "12"), relief="sunken", state="disable")
 b_robot.grid(column=1, row=7, sticky="w", rowspan=3, padx=10, pady=5)
 
 # kept gridded-but-hidden for now: was going to be the "Resume" flow's companion Reset button, parked along
 # with Resume itself (see the note in gui_robot_btn_update()) - the big b_robot button alone still handles
 # Reset for the shipped (Resume-less) behavior.
-b_reset = tk.Button(gui_robot_label, text="Reset", height=1, width=11, command=reset_robot_and_gui)
-b_reset.configure(font=("Segoe UI", "11"))
+b_reset = FlatButton(gui_robot_label, text="Reset", height=1, width=11, command=reset_robot_and_gui)
+b_reset.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_reset)
 b_reset.grid(column=1, row=10, sticky="w", padx=10, pady=2)
 b_reset.grid_remove()
 
-b_refresh = tk.Button(gui_robot_label, text="Refresh COM", height=1, width=12, command=update_coms)
-b_refresh.configure(font=("Segoe UI", "11"))
+b_refresh = FlatButton(gui_robot_label, text="Refresh COM", height=1, width=12, command=update_coms)
+b_refresh.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_refresh)
 b_refresh.grid(column=0, row=7, sticky="w", padx=10, pady=5)
 
-b_connect = tk.Button(gui_robot_label, text="Connect", height=1, width=12, state="disable", command=connection)
-b_connect.configure(font=("Segoe UI", "11"))
+b_connect = FlatButton(gui_robot_label, text="Connect", height=1, width=12, state="disable", command=connection)
+b_connect.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_connect)
 b_connect.grid(column=0, row=9, sticky="w", padx=10, pady=5)
 
@@ -2876,12 +3056,12 @@ gui_prog_bar = ttk.Progressbar(gui_robot_label, orient="horizontal", length=175,
 gui_prog_bar.grid(column=0, row=12, sticky="w", padx=10, pady=10, columnspan=2)
 
 gui_prog_label_text = tk.StringVar()
-gui_prog_label = tk.Label(gui_robot_label, height=1, width=5, textvariable=gui_prog_label_text, font=("Segoe UI", 12), bg=UI_BTN_SECONDARY_BG)
+gui_prog_label = tk.Label(gui_robot_label, height=1, width=5, textvariable=gui_prog_label_text, font=(UI_FONT_FAMILY, 12), bg=UI_BTN_SECONDARY_BG)
 gui_prog_label.grid(column=1, sticky="e", row=12, padx=10, pady=10)
 
-b_settings = tk.Button(gui_robot_label, text="Settings window", height=1, width=26, state="disable",
+b_settings = FlatButton(gui_robot_label, text="Settings window", height=1, width=26, state="disable",
                        command= lambda: show_window(settingWindow))
-b_settings.configure(font=("Segoe UI", "11"))
+b_settings.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_settings)
 b_settings.grid(column=0, row=13, columnspan=2,  padx=10, pady=5)
 
@@ -2893,9 +3073,9 @@ b_settings.grid(column=0, row=13, columnspan=2,  padx=10, pady=5)
 # ############################### Settings windows widgets #############################################################
 
 #### general settings related widgets ####   
-b_back = tk.Button(settingWindow, text="Main page", #fg='red', activeforeground= 'red',
+b_back = FlatButton(settingWindow, text="Main page", #fg='red', activeforeground= 'red',
                    height=1, width=12, state="active", command= lambda: show_window(mainWindow))
-b_back.configure(font=("Segoe UI", "12"))
+b_back.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(b_back)   # option_add-only coloring rendered near-black on this Windows/Tk combo for
                                   # some buttons regardless of state toggling (the bug style_secondary_button()
                                   # was written for elsewhere) - explicit colors sidestep it here too.
@@ -2904,16 +3084,16 @@ b_back.grid(row=0, column=2, sticky="w", padx=20, pady=10)
 
 
 #### getting and sending settings from/to the robot ####
-b_get_settings = tk.Button(settingWindow, text="Get current CUBOTino settings", height=1, width=26,
+b_get_settings = FlatButton(settingWindow, text="Get current CUBOTino settings", height=1, width=26,
                            state="active", command= get_current_servo_settings)
-b_get_settings.configure(font=("Segoe UI", "11"))
+b_get_settings.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_get_settings)
 b_get_settings.grid(row=0, column=0, sticky="w", padx=20, pady=10)
 
 
-b_send_settings = tk.Button(settingWindow, text="Send new settings to CUBOTino", height=1, width=26,
+b_send_settings = FlatButton(settingWindow, text="Send new settings to CUBOTino", height=1, width=26,
                            state="active", command= send_new_servo_settings)
-b_send_settings.configure(font=("Segoe UI", "11"))
+b_send_settings.configure(font=(UI_FONT_FAMILY, "11"))
 style_secondary_button(b_send_settings)
 b_send_settings.grid(row=0, column=1, sticky="w", padx=20, pady=10)
 
@@ -2929,40 +3109,40 @@ b_send_settings.grid(row=0, column=1, sticky="w", padx=20, pady=10)
 
 # overall label frame for the servos pulse width section
 srv_pw_label = tk.LabelFrame(settingWindow, text="Servos - pulse width range",
-                             labelanchor="nw", font=("Segoe UI", "12"))
+                             labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 srv_pw_label.grid(row=1, column=0, rowspan=2, columnspan=5, sticky="w", padx=20, pady=15)
 
 servos_modes=[("1-2 ms","small"),("0.5-2.5ms","large")]
 
 # label frame and radiobutton for the top servo pulse width
-t_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Top servo", labelanchor="nw", font=("Segoe UI", "12"))
+t_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Top servo", labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 t_srv_pw_label.grid(row=1, column=0, rowspan=2, columnspan=2, sticky="w", padx=20, pady=15)
 gui_var_t_srv_pw = tk.StringVar()
 pos=0
 for servos_mode, servos_pw in servos_modes:
     rb_srv=tk.Radiobutton(t_srv_pw_label, text=servos_mode, variable=gui_var_t_srv_pw, value=servos_pw)
-    rb_srv.configure(font=("Segoe UI", "10"))
+    rb_srv.configure(font=(UI_FONT_FAMILY, "10"))
     rb_srv.grid(row=2, column=pos, sticky="w", padx=12, pady=5)
     pos+=1
 gui_var_t_srv_pw.set(t_srv_pw_range)
 
 # label frame and radiobutton for the bottom servo pulse width
-b_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Bottom servo", labelanchor="nw", font=("Segoe UI", "12"))
+b_srv_pw_label = tk.LabelFrame(srv_pw_label, text="Bottom servo", labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 b_srv_pw_label.grid(row=1, column=2, rowspan=2, columnspan=2, sticky="w", padx=20, pady=15)
 servos_modes=[("1-2 ms","small"),("0.5-2.5ms","large")]
 gui_var_b_srv_pw = tk.StringVar()
 pos=0
 for servos_mode, servos_pw in servos_modes:
     rb_srv=tk.Radiobutton(b_srv_pw_label, text=servos_mode, variable=gui_var_b_srv_pw, value=servos_pw)
-    rb_srv.configure(font=("Segoe UI", "10"))
+    rb_srv.configure(font=(UI_FONT_FAMILY, "10"))
     rb_srv.grid(row=2, column=pos, sticky="w", padx=12, pady=5)
     pos+=1
 gui_var_b_srv_pw.set(b_srv_pw_range)
 
 
 # button to process the servos pulse width choice
-pw_update_btn = tk.Button(srv_pw_label, text="confirm\nchanges", height=2, width=18, state="active", command= pw_update)
-pw_update_btn.configure(font=("Segoe UI", "12"))
+pw_update_btn = FlatButton(srv_pw_label, text="confirm\nchanges", height=2, width=18, state="active", command= pw_update)
+pw_update_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(pw_update_btn)
 pw_update_btn.grid(row=2, column=5, sticky="w", padx=15, pady=10)
 
@@ -2971,7 +3151,7 @@ pw_update_btn.grid(row=2, column=5, sticky="w", padx=15, pady=10)
 
 #### top servo related widgets ####
 top_srv_label = tk.LabelFrame(settingWindow, text="Top cover - servo settings",
-                                   labelanchor="nw", font=("Segoe UI", "12"))
+                                   labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 top_srv_label.grid(row=3, column=0, rowspan=3, columnspan=4, sticky="w", padx=20, pady=0)
 
 s_top_srv_flip = tk.Scale(top_srv_label, label="PWM flip", font=('Segoe UI','11'), orient='horizontal',
@@ -2998,18 +3178,18 @@ s_top_srv_release.grid(row=4, column=3, sticky="w", padx=12, pady=5)
 s_top_srv_release.set(t_servo_close)
 
 
-flip_btn = tk.Button(top_srv_label, text="FLIP  (toggle)", height=1, width=18, state="active", command= flip_cube)
-flip_btn.configure(font=("Segoe UI", "12"))
+flip_btn = FlatButton(top_srv_label, text="FLIP  (toggle)", height=1, width=18, state="active", command= flip_cube)
+flip_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(flip_btn)
 flip_btn.grid(row=5, column=0, sticky="w", padx=15, pady=10)
 
-open_btn = tk.Button(top_srv_label, text="OPEN", height=1, width=18, state="active", command= open_top_cover)
-open_btn.configure(font=("Segoe UI", "12"))
+open_btn = FlatButton(top_srv_label, text="OPEN", height=1, width=18, state="active", command= open_top_cover)
+open_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(open_btn)
 open_btn.grid(row=5, column=1, sticky="w", padx=15, pady=10)
 
-top_close_btn = tk.Button(top_srv_label, text="CLOSE", height=1, width=18, state="active", command= close_top_cover)
-top_close_btn.configure(font=("Segoe UI", "12"))
+top_close_btn = FlatButton(top_srv_label, text="CLOSE", height=1, width=18, state="active", command= close_top_cover)
+top_close_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(top_close_btn)
 top_close_btn.grid(row=5, column=2, sticky="w", padx=15, pady=10)
 # named distinctly from the bottom-servo "HOME" button below (which used to share this exact variable name,
@@ -3051,7 +3231,7 @@ s_top_srv_open_close_time.set(t_open_close_time)
 
 #### bottom servo related widgets ####
 b_srv_label = tk.LabelFrame(settingWindow, text="Cube holder - servo settings",
-                                   labelanchor="nw", font=("Segoe UI", "12"))
+                                   labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 b_srv_label.grid(row=7, column=0, columnspan=5, sticky="w", padx=20, pady=10)
 
 
@@ -3088,7 +3268,7 @@ s_btm_srv_extra_home.set(b_extra_home)
 def _jog_button(parent, label, command):
     """A small +/- jog button, styled the same way every other secondary button in this window is (see
     style_secondary_button()'s own docstring for why that's needed rather than relying on option_add alone)."""
-    btn = tk.Button(parent, text=label, width=3, command=command)
+    btn = FlatButton(parent, text=label, width=3, command=command)
     style_secondary_button(btn)
     btn.pack(side="left", padx=3)
     return btn
@@ -3112,20 +3292,20 @@ _jog_btns.append(_jog_button(s_btm_srv_CW_jog, "−", lambda: jog_bottom(s_btm_s
 _jog_btns.append(_jog_button(s_btm_srv_CW_jog, "+", lambda: jog_bottom(s_btm_srv_CW, 1)))
 
 
-CCW_btn = tk.Button(b_srv_label, text="CCW", height=1, width=18, state="active", command= ccw)
-CCW_btn.configure(font=("Segoe UI", "12"))
+CCW_btn = FlatButton(b_srv_label, text="CCW", height=1, width=18, state="active", command= ccw)
+CCW_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(CCW_btn)
 CCW_btn.grid(row=10, column=0, sticky="w", padx=15, pady=10)
 
 
-close_btn = tk.Button(b_srv_label, text="HOME", height=1, width=18, state="active", command= home)
-close_btn.configure(font=("Segoe UI", "12"))
+close_btn = FlatButton(b_srv_label, text="HOME", height=1, width=18, state="active", command= home)
+close_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(close_btn)
 close_btn.grid(row=10, column=1, sticky="w", padx=15, pady=10)
 
 
-CW_btn = tk.Button(b_srv_label, text="CW", height=1, width=18, state="active", command= cw)
-CW_btn.configure(font=("Segoe UI", "12"))
+CW_btn = FlatButton(b_srv_label, text="CW", height=1, width=18, state="active", command= cw)
+CW_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(CW_btn)
 CW_btn.grid(row=10, column=2, sticky="w", padx=15, pady=10)
 
@@ -3152,7 +3332,7 @@ s_btm_srv_rel_time.set(b_rel_time)
 
 
 #### webcam  ####
-webcam_label = tk.LabelFrame(settingWindow, text="Webcam", labelanchor="nw", font=("Segoe UI", "12"))
+webcam_label = tk.LabelFrame(settingWindow, text="Webcam", labelanchor="nw", font=(UI_FONT_FAMILY, "12"))
 webcam_label.grid(row=9, column=0, columnspan=6, sticky="w", padx=20, pady=10)
 
 # radiobuttons for webcam source
@@ -3160,7 +3340,7 @@ webcam_nums=[0,1] #,2]
 gui_webcam_num = tk.IntVar()
 for i, webcam_num in enumerate(webcam_nums):
     rb=tk.Radiobutton(webcam_label, text=webcam_num, variable=gui_webcam_num, value=webcam_num)
-    rb.configure(font=("Segoe UI", "10"))
+    rb.configure(font=(UI_FONT_FAMILY, "10"))
     rb.grid(row=10, column=0+i, sticky="w", padx=6, pady=0)
 gui_webcam_num.set(cam_number)
 
@@ -3189,23 +3369,23 @@ s_facelets.grid(row=10, column=6, sticky="w", padx=8, pady=5)
 s_facelets.set(facelets_in_width)
 
 
-save_cam_num_btn = tk.Button(webcam_label, text="save cam settings", height=1, width=16, state="active",
+save_cam_num_btn = FlatButton(webcam_label, text="save cam settings", height=1, width=16, state="active",
                     command= save_webcam)
-save_cam_num_btn.configure(font=("Segoe UI", "12"))
+save_cam_num_btn.configure(font=(UI_FONT_FAMILY, "12"))
 style_secondary_button(save_cam_num_btn)
 save_cam_num_btn.grid(row=10, column=8, sticky="w", padx=10, pady=10)
 
 
-scan_mode_label = tk.Label(webcam_label, text="scanning method", font=("Segoe UI", "11"))
+scan_mode_label = tk.Label(webcam_label, text="scanning method", font=(UI_FONT_FAMILY, "11"))
 scan_mode_label.grid(row=11, column=0, sticky="w", padx=8, pady=5)
 
 gui_scan_mode = tk.StringVar()
 rb_scan_auto = tk.Radiobutton(webcam_label, text="Auto-detect", variable=gui_scan_mode, value="auto")
-rb_scan_auto.configure(font=("Segoe UI", "10"))
+rb_scan_auto.configure(font=(UI_FONT_FAMILY, "10"))
 rb_scan_auto.grid(row=11, column=1, sticky="w", padx=6, pady=0)
 
 rb_scan_grid = tk.Radiobutton(webcam_label, text="Fixed grid", variable=gui_scan_mode, value="grid")
-rb_scan_grid.configure(font=("Segoe UI", "10"))
+rb_scan_grid.configure(font=(UI_FONT_FAMILY, "10"))
 rb_scan_grid.grid(row=11, column=2, sticky="w", padx=6, pady=0)
 
 gui_scan_mode.set("auto")
@@ -3216,7 +3396,7 @@ gui_scan_mode.set("auto")
 checkVar2 = tk.IntVar()
 c_estimate = tk.Checkbutton(webcam_label, text="estimate facelets \n(beta version)", variable=checkVar2,
                             command=estimate_fclts_check, onvalue=1, offvalue=0)
-c_estimate.configure(font=("Segoe UI", "11"))
+c_estimate.configure(font=(UI_FONT_FAMILY, "11"))
 c_estimate.grid(row=12, column=0, columnspan=2, sticky="w", padx=8, pady=10)
 add_tooltip(c_estimate, "If 1-2 facelets on a face aren't detected directly (glare, a scratch, a tilted "
             "cube), predicts their position from the other facelets instead of waiting for a clean direct "
@@ -3227,7 +3407,7 @@ add_tooltip(c_estimate, "If 1-2 facelets on a face aren't detected directly (gla
 checkVar1 = tk.IntVar()
 c_debug = tk.Checkbutton(webcam_label, text="debug print-out\n(webcam)", variable=checkVar1,
                          command=debug_check, onvalue=1, offvalue=0)
-c_debug.configure(font=("Segoe UI", "11"))
+c_debug.configure(font=(UI_FONT_FAMILY, "11"))
 c_debug.grid(row=12, column=2, columnspan=2, sticky="w", padx=8, pady=10)
 add_tooltip(c_debug, "Prints extra diagnostic detail to the terminal while scanning (measured colors, "
             "contour counts, detection decisions). Doesn't change what the camera does - only useful when "
@@ -3286,6 +3466,27 @@ for _btn in (pw_update_btn, flip_btn, open_btn, top_close_btn, CCW_btn, close_bt
 
 _add_hover_feedback(root)                         # adds mouse-over feedback to every button, now that they're all built
 root.protocol("WM_DELETE_WINDOW", close_window)   # the function close_function is called when the windows is closed
+
+# Cmd+Q / Dock "Quit", on a bare `python3` process with no proper .app bundle, does not reach Tk as a Tcl-level
+# event at all: macOS's WindowServer/Dock terminates the process with a plain SIGTERM. TkAqua installs its own
+# C-level SIGTERM handler (TkMacOSXSignalHandler) that calls Tcl_Exit() directly from signal context; that
+# then recurses through Tk_DestroyWindow, which fires a bound Python callback while the interpreter is mid
+# shutdown - crashing with SIGABRT ("python quit unexpectedly"). This was confirmed two ways: it is 100%
+# reproducible via macOS's own crash reports (same TkMacOSXSignalHandler -> Tcl_Exit -> PyEval_RestoreThread
+# stack every time), and overriding the Tcl "::tk::mac::Quit" proc - the right fix for a *bundled* app
+# receiving a real Apple Event - did NOT stop it, which is what exposed that the actual trigger is the signal,
+# not that proc.
+# The fix: install our own Python-level SIGTERM (and SIGINT, for Ctrl+C in a terminal) handler. Registering one
+# via signal.signal() replaces Tk's C handler for that signal outright - verified directly (a minimal Tk probe,
+# `kill -TERM`'d, exits clean without any crash report only once this is added). CPython runs a Python signal
+# handler on the main thread between bytecodes rather than in raw async-signal-unsafe context, so calling
+# close_window() from here is safe, unlike letting Tcl_Exit do it from inside the actual signal trampoline.
+def _handle_termination_signal(signum, frame):
+    close_window()
+
+signal.signal(signal.SIGTERM, _handle_termination_signal)
+signal.signal(signal.SIGINT, _handle_termination_signal)
+
 root.mainloop()                                   # tkinter main loop
 
 ########################################################################################################################
