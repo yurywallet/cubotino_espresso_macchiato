@@ -134,7 +134,8 @@ import tkinter as tk                 # GUI library
 from tkinter import ttk              # GUI library
 import numpy as np                   # used to bake the flat/rounded button images (see _rounded_button_photo())
 import datetime as dt                # date and time library used as timestamp on a few situations (i.e. data log)
-import threading                     # threading library, to parallelize uart data 
+import threading                     # threading library, to parallelize uart data
+import queue                         # thread-safe hand-off of serial lines to the main thread - see readSerial()
 import time                          # time library is imported
 import os                            # os is imported to ensure the file presence, check/make
 from collections import Counter       # count cube colors for a basic sanity check
@@ -804,7 +805,15 @@ def solve():
             cube_status[key]=starting_defstr[key]            # dict generation
         previous_move=0                                      # previous move set to zero
 
-    gui_f2.update()                     # GUI f2 part is updated, to release eventual clicks on robot button
+    # update_idletasks(), not update(): a bare .update() pumps and processes Tk's WHOLE pending event queue
+    # right here, reentrantly, from inside this very click-handler call stack - including any root.after(0, ...)
+    # callback the serial-reading thread has queued (see readSerial()/_process_serial_line()) or another
+    # button click, both now running nested inside this one. That reentrancy is exactly what crashed the app
+    # with a segfault deep inside Tcl (confirmed live, right after start_robot()'s own gui_f2.update() call) -
+    # update_idletasks() only repaints/re-lays-out pending widget changes, without touching the event queue,
+    # which is all every one of these calls actually needs: a queued click a moment early doesn't fire any
+    # sooner or later than it would anyway once this handler returns control to the mainloop.
+    gui_f2.update_idletasks()           # GUI f2 part is repainted
     b_robot["state"] = "active"         # GUI robot button is activated after solve() function
     b_robot["relief"] = "raised"        # GUI robot button is raised after solve() function
     gui_robot_btn_update()              # updates the cube related buttons status
@@ -1096,7 +1105,7 @@ def gui_buttons_for_cube_status(status):
     try:
         if status == "active":                   # case the function argument is "active"
             b_read_solve["relief"] = "raised"    # button read&solve is raised
-            gui_f2.update()                      # frame2 gui part is updated
+            gui_f2.update_idletasks()           # frame2 gui part is repainted - not update(), see solve()'s note
         b_read_solve["state"] = status           # button read&solve activated, or disabled, according to args
         b_clean["state"] = status                # button clean activated, or disabled, according to args
         b_empty["state"] = status                # button empty activated, or disabled, according to args
@@ -1104,7 +1113,7 @@ def gui_buttons_for_cube_status(status):
 
         if status=="disable":                    # case the function argument is "disable"
             b_read_solve["relief"] = "sunken"    # button read&solve is lowered
-            gui_f2.update()                      # frame2 gui part is updated
+            gui_f2.update_idletasks()           # frame2 gui part is repainted - not update(), see solve()'s note
             return "disable"                     # string "disable" is returned
     except:
         return "error"
@@ -1233,7 +1242,7 @@ def start_robot():
         robot_working=True                              # boolean that tracks the robot working is set True
         left_Cubotino_moves(robot_moves)                # left moves of the robot are calculated / stored
         gui_prog_bar["value"]=0                         # progress bar is set to zero
-        gui_f2.update()                                 # frame2 of the gui is updated
+        gui_f2.update_idletasks()                       # frame2 of the gui is repainted - not update(), see solve()'s note
         gui_f2.after(1000, gui_robot_btn_update)        # updates the cube related buttons status, with 1 sec delay
 
 
@@ -1554,7 +1563,7 @@ def progress_update(received):
         gui_prog_label_text.set("")                       # progress label is set empty
 
     gui_prog_bar.update_idletasks()                       # gui widget (progress bar) is updated
-    gui_prog_label.update()                               # gui widget (progress label) is updated
+    gui_prog_label.update_idletasks()                     # gui widget (progress label) is repainted - not update(), see solve()'s note
 
 
 
@@ -1873,18 +1882,31 @@ def connection():
         t1 = threading.Thread(target=readSerial)     # a thread is associated to the readSerial function
         t1.deamon = True                             # thread is set as deamon (runs in background with low priority)
         t1.start()                                   # thread is started
+        root.after(50, _poll_serial_queue)           # starts draining what readSerial() queues - see its own docstring
 
 
 
 
+
+
+_serial_line_queue = queue.Queue()   # thread-safe hand-off, background thread -> main thread; see readSerial()
 
 
 def readSerial():
-    """Functon, called by a daemon thread, that keeps reading the serial port."""
-    
-    global serialData, robot_working, gui_prog_bar, cube_solving_string, cube_solving_string_robot
-    global end_method, robot_time, just_stopped
-    
+    """Functon, called by a daemon thread, that keeps reading the serial port. This thread makes NO Tk/Tcl call
+    of any kind - not even root.after() to schedule one. It does purely blocking I/O (ser.readline()) and
+    stdlib-only work (decode, queue.Queue.put()), then _poll_serial_queue() (below), running only on the main
+    thread via its own root.after() self-reschedule, drains the queue and does the actual handling.
+    This is a step more defensive than just wrapping the handling in root.after() from here (which was tried
+    first and still crashed): even root.after() itself - called from this thread, not just the callback it
+    schedules - turned out to occasionally segfault on this Tk 9/Aqua build (confirmed live: a bus error deep
+    inside Tcl's own event dispatch, immediately on the first connection of a fresh run, with the reader thread
+    barely started). queue.Queue is a plain thread-safe stdlib primitive with no Tcl involvement at all, so
+    nothing this thread does can reach into Tk's C internals from the wrong thread, regardless of what exact
+    mechanism made root.after() itself unsafe to call from here."""
+
+    global serialData
+
     while serialData and ser.isOpen():    # script has set the conditions for Serail com and serial port is found open
         try:
             data = ser.readline()                                     # serial dat is read by lines
@@ -1896,92 +1918,128 @@ def readSerial():
                 received = data.decode()                              # data is decoded
                 received=received.strip().strip("\n")                 # empty space and LF characters removed
             except:
-                pass
-
-            if "conn" in received:                                    # case 'conn' is in received: ESP32 is connectd
-                print("established connection with ESP32\n")          # feedback is printed to the terminal
-
-
-            elif "<" in received and ">" in received:                 # robot replies with the received solving string
-                if received==cube_solving_string_robot.strip("\r\n"): # check if the robot received string is ok
-                    print("ESP32 acknowledged the solution")
-                else:
-                    print(f"cube_solving_string_robot received by the robot differs from :{cube_solving_string_robot}")
-                    print("====================================================================================")
-
-
-            elif "stop" in received and robot_working==True:          # case 'stop' is in received: Robot been stopped
-                print("\nstop command has been received by the robot\n")  # feedback is printed to the terminal
-                print("====================================================================================")
-                robot_working=False                                   # boolean trcking the robot working is set False
-                end_method="stopped"                                  # variable tracking the end method
-                just_stopped=True   # drives gui_robot_btn_update() to offer a Reset button instead of "No data"
-                if '(' in received and ')' in received:               # case the dat contains open and close parenthesis
-                    data_start = received.find('(')                   # position of open parenthesys in received
-                    data_end = received.find(')')                     # position of close parenthesys in received
-                    robot_time = received[data_start+1:data_end]      # data between parenthesys is assigned
-                log_data()                                            # log the more relevant data
-                progress_update('i_end')                              # progress feedback is ise to end
-                gui_text_window.delete(1.0, tk.END)                   # clears the text window
-                cube_solving_string=""                                # cube solving string is set empty
-                gui_robot_btn_update()                                # updates the cube related buttons status
-
-
-            elif ("servo_plan:" in received or "servo_step_start:" in received or
-                  "servo_step_done:" in received or "servo_status:" in received):
-                print("ESP32 servo log: {}".format(received))
-                show_text("Servo log: {}\n".format(received))
-
-
-            elif "start" in received:                                 # case 'start' is received: Robot is solving
-                print("start command has been received by the robot") # feedback is printed to the terminal
-
-
-            elif "i_" in received:                                    # case 'i_' is received: Robot progress index
-                progress_update(received)                             # progress function is called
-
-
-            elif "solved" in received:                                # case 'solved' is in received: Robot is solving                          
-                robot_time=0.0
-                robot_working=False                                   # boolean trcking the robot working is set False
-                if gui_scramble_var.get():                            # case the scramble check box is checked
-                    end_method="scrambled"                            # variable tracking the end method
-                elif not gui_scramble_var.get():                      # case the scramble check box is not checked
-                    end_method="solved"                               # variable tracking the end method
-                if '(' in received and ')' in received:               # case the dat contains open and close parenthesis
-                    data_start = received.find('(')                   # position of open parenthesys in received
-                    data_end = received.find(')')                     # position of close parenthesys in received
-                    robot_time = received[data_start+1:data_end]      # data between parenthesys is assigned
-                log_data()                                            # log the more relevant data
-                gui_text_window.delete(1.0, tk.END)                   # clears the text window
-                cube_solving_string=""                                # cube solving string is set empty
-                
-                show_text(f"\n Cube {end_method} in: {robot_time} secs")  # feedback is showed on the GUI                
-                print(f"\nCube {end_method}, in: {robot_time} secs")      # feedback to the terminal
-                print("\n===========================================================================================")
-                gui_robot_btn_update()                                    # updates the cube related buttons status
-
-
-            elif "current_settings" in received:                      # case 'current_settings' is in received 
-                print("\nservos settings request has been received by the robot")  # feedback is printed to the terminal
-                robot_received_settings(received)                     # robot_received_settings function is called
-            
-
-            elif "new_settings" in received:                          # case 'new_settings' is in received 
-                print("new servos settings has been received by the robot")   # feedback is printed to the terminal
-
-            
-            else:                                                     # case not expected data is received
-                if data=='\n':
-                    pass
-                else:
-                    print(f"unexpected data received by the robot: {received}") # feedback is printed to the terminal
+                received = ''
+            _serial_line_queue.put((data, received))                  # picked up by _poll_serial_queue() on the main thread
 
         else:                                                 # case there not countable characters read from the serial
             if data!=b"":                                     # case the character is not an empty binary
                 print(f"len data not >0")                     # feedback is printed to the terminal
                 print(f"undecoded data from robot: {data}")   # feedback is printed to the terminal
                 break                                         # while loop is interrupted
+
+
+def _poll_serial_queue():
+    """Runs only on the main thread (started once via root.after() right after readSerial()'s thread is
+    launched, and re-schedules itself the same way each time - the same self-rescheduling pattern already used
+    elsewhere in this file, e.g. gui_f2.after(1000, gui_robot_btn_update)). Drains whatever readSerial() has
+    queued since the last poll and hands each line to _process_serial_line(), all safely on the main thread.
+    Stops rescheduling once serialData goes False (disconnect/close), matching readSerial()'s own loop
+    condition, so the two don't outlive each other."""
+
+    while True:
+        try:
+            data, received = _serial_line_queue.get_nowait()
+        except queue.Empty:
+            break
+        _process_serial_line(data, received)
+
+    if serialData:
+        root.after(50, _poll_serial_queue)
+
+
+def _process_serial_line(data, received):
+    """Handles one decoded serial line from the robot - always on the main thread, via _poll_serial_queue()
+    (itself only ever run by a root.after() self-reschedule), never directly on the background thread that
+    reads the serial port. Every branch below touches Tk (show_text(), progress_update(),
+    gui_robot_btn_update(), gui_text_window.delete(), log_data()'s gui_read_var.get()), and this app's whole
+    point is sending real move sequences to a physical robot - Tk driven off the main thread has crashed this
+    app outright multiple times (a Cocoa "nextEventMatchingMask should only be called from the Main Thread!"
+    abort when this handling ran directly on the reader thread; then, even after moving it here via
+    root.after(0, ...), a bus error inside Tcl's own dispatch from root.after() itself being called FROM that
+    thread) - see readSerial()'s docstring for why even scheduling is now kept off that thread entirely."""
+
+    global serialData, robot_working, gui_prog_bar, cube_solving_string, cube_solving_string_robot
+    global end_method, robot_time, just_stopped
+
+    if "conn" in received:                                    # case 'conn' is in received: ESP32 is connectd
+        print("established connection with ESP32\n")          # feedback is printed to the terminal
+
+
+    elif "<" in received and ">" in received:                 # robot replies with the received solving string
+        if received==cube_solving_string_robot.strip("\r\n"): # check if the robot received string is ok
+            print("ESP32 acknowledged the solution")
+        else:
+            print(f"cube_solving_string_robot received by the robot differs from :{cube_solving_string_robot}")
+            print("====================================================================================")
+
+
+    elif "stop" in received and robot_working==True:          # case 'stop' is in received: Robot been stopped
+        print("\nstop command has been received by the robot\n")  # feedback is printed to the terminal
+        print("====================================================================================")
+        robot_working=False                                   # boolean trcking the robot working is set False
+        end_method="stopped"                                  # variable tracking the end method
+        just_stopped=True   # drives gui_robot_btn_update() to offer a Reset button instead of "No data"
+        if '(' in received and ')' in received:               # case the dat contains open and close parenthesis
+            data_start = received.find('(')                   # position of open parenthesys in received
+            data_end = received.find(')')                     # position of close parenthesys in received
+            robot_time = received[data_start+1:data_end]      # data between parenthesys is assigned
+        log_data()                                            # log the more relevant data
+        progress_update('i_end')                              # progress feedback is ise to end
+        gui_text_window.delete(1.0, tk.END)                   # clears the text window
+        cube_solving_string=""                                # cube solving string is set empty
+        gui_robot_btn_update()                                # updates the cube related buttons status
+
+
+    elif ("servo_plan:" in received or "servo_step_start:" in received or
+          "servo_step_done:" in received or "servo_status:" in received):
+        print("ESP32 servo log: {}".format(received))
+        show_text("Servo log: {}\n".format(received))
+
+
+    elif "start" in received:                                 # case 'start' is received: Robot is solving
+        print("start command has been received by the robot") # feedback is printed to the terminal
+
+
+    elif "i_" in received:                                    # case 'i_' is received: Robot progress index
+        progress_update(received)                             # progress function is called
+
+
+    elif "solved" in received:                                # case 'solved' is in received: Robot is solving                          
+        robot_time=0.0
+        robot_working=False                                   # boolean trcking the robot working is set False
+        if gui_scramble_var.get():                            # case the scramble check box is checked
+            end_method="scrambled"                            # variable tracking the end method
+        elif not gui_scramble_var.get():                      # case the scramble check box is not checked
+            end_method="solved"                               # variable tracking the end method
+        if '(' in received and ')' in received:               # case the dat contains open and close parenthesis
+            data_start = received.find('(')                   # position of open parenthesys in received
+            data_end = received.find(')')                     # position of close parenthesys in received
+            robot_time = received[data_start+1:data_end]      # data between parenthesys is assigned
+        log_data()                                            # log the more relevant data
+        gui_text_window.delete(1.0, tk.END)                   # clears the text window
+        cube_solving_string=""                                # cube solving string is set empty
+                
+        show_text(f"\n Cube {end_method} in: {robot_time} secs")  # feedback is showed on the GUI                
+        print(f"\nCube {end_method}, in: {robot_time} secs")      # feedback to the terminal
+        print("\n===========================================================================================")
+        gui_robot_btn_update()                                    # updates the cube related buttons status
+
+
+    elif "current_settings" in received:                      # case 'current_settings' is in received 
+        print("\nservos settings request has been received by the robot")  # feedback is printed to the terminal
+        robot_received_settings(received)                     # robot_received_settings function is called
+            
+
+    elif "new_settings" in received:                          # case 'new_settings' is in received 
+        print("new servos settings has been received by the robot")   # feedback is printed to the terminal
+
+            
+    else:                                                     # case not expected data is received
+        if data=='\n':
+            pass
+        else:
+            print(f"unexpected data received by the robot: {received}") # feedback is printed to the terminal
+
 
 
 
@@ -2551,6 +2609,15 @@ class FlatButton(tk.Label):
        reassigned at runtime from a variable (e.g. b_read_solve["state"] = status).
      - a Label has no pressed appearance, so press/release is drawn here; without it a click gives no feedback
        at all on the buttons _round_button() hasn't processed.
+     - the real Tk widget is NEVER actually told to go 'disabled' (see _apply_state below) - that state is
+       simulated entirely with our own fg/cursor. A disabled Label on this Tk 9/Aqua build renders with its
+       whole text invisible even though the surrounding image/fill still paints fine (confirmed live: b_refresh
+       - a rounded FlatButton with 'Refresh COM' baked as compound text over its pill image - went from a
+       normal-looking labeled button to a blank colored pill the moment it was disabled, and nothing else in
+       that transition touches the image). Whatever the underlying cause, relying on Tk's native disabled
+       rendering is unreliable for this widget, so 'disabled' is instead just: dim fg to disabledforeground,
+       drop the hand cursor, and block clicks - while every external reader of button['state'] keeps seeing
+       the correct value via the cget() override below, so nothing else in this file needs to change.
     """
 
     def __init__(self, master=None, command=None, **kw):
@@ -2567,21 +2634,32 @@ class FlatButton(tk.Label):
         kw.setdefault('pady', 6)
         kw.setdefault('cursor', 'hand2')
         kw.setdefault('takefocus', 0)
-        if 'state' in kw:
-            kw['state'] = self._normalise_state(kw['state'])
-        tk.Label.__init__(self, master, **kw)
+        requested_state = self._normalise_state(kw.pop('state', 'normal'))
+        tk.Label.__init__(self, master, **kw)   # always constructed at the real Tk 'normal' state - see class docstring
         self._command = command
         self._pressed = False
+        self._logical_state = 'normal'
+        self._normal_fg = self['fg']
         self.bind('<Button-1>', self._on_press, add='+')
         self.bind('<ButtonRelease-1>', self._on_release, add='+')
+        if requested_state == 'disabled':
+            self._apply_state('disabled')
 
     @staticmethod
     def _normalise_state(value):
-        # "active" means "enabled" at this app's call sites, not "draw me in my hover color forever"
-        return 'normal' if str(value) == 'active' else value
+        # this app spells "enabled" as "active" and "disabled" as "disable" throughout - collapse every
+        # spelling actually used at its call sites to the two logical states this widget implements
+        return 'disabled' if str(value) in ('disable', 'disabled') else 'normal'
+
+    def _apply_state(self, logical_state):
+        self._logical_state = logical_state
+        if logical_state == 'disabled':
+            tk.Label.configure(self, fg=self['disabledforeground'], cursor='arrow')
+        else:
+            tk.Label.configure(self, fg=self._normal_fg, cursor='hand2')
 
     def _enabled(self):
-        return str(self['state']) != 'disabled'
+        return self._logical_state != 'disabled'
 
     def _on_press(self, event=None):
         if not self._enabled():
@@ -2613,13 +2691,17 @@ class FlatButton(tk.Label):
             self._command()
 
     def configure(self, cnf=None, **kw):
-        if 'command' in kw:
-            self._command = kw.pop('command')
-        if 'state' in kw:
-            kw['state'] = self._normalise_state(kw['state'])
-        if isinstance(cnf, dict) and 'state' in cnf:
-            cnf = dict(cnf, state=self._normalise_state(cnf['state']))
-        return tk.Label.configure(self, cnf, **kw)
+        merged = dict(cnf) if isinstance(cnf, dict) else {}
+        merged.update(kw)
+        if 'command' in merged:
+            self._command = merged.pop('command')
+        state_val = self._normalise_state(merged.pop('state')) if 'state' in merged else None
+        if 'fg' in merged and self._logical_state != 'disabled':
+            self._normal_fg = merged['fg']   # keep the "restore to this on re-enable" color current
+        result = tk.Label.configure(self, **merged) if merged else None
+        if state_val is not None:
+            self._apply_state(state_val)
+        return result
 
     config = configure
 
@@ -2628,8 +2710,22 @@ class FlatButton(tk.Label):
             self._command = value
             return
         if key == 'state':
-            value = self._normalise_state(value)
+            self._apply_state(self._normalise_state(value))
+            return
+        if key == 'fg' and self._logical_state != 'disabled':
+            self._normal_fg = value
         tk.Label.__setitem__(self, key, value)
+
+    def cget(self, key):
+        if key == 'state':
+            return self._logical_state
+        return tk.Label.cget(self, key)
+
+    # tkinter.Misc.__getitem__ is a raw alias to the base (Tcl-calling) cget, not a call through self.cget() -
+    # `btn['state']` would otherwise silently skip the override just above and read the real (always-'normal')
+    # Tk state instead of the logical one, exactly like _add_hover_feedback() and every b_x["state"]==... check
+    # in this file relies on.
+    __getitem__ = cget
 
     def invoke(self):
         if self._enabled() and self._command is not None:
